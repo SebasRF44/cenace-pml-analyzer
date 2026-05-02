@@ -965,5 +965,3 @@ if boton and nodos and f_ini < f_fin:
 # ─────── FOOTER ───────
 st.divider()
 st.caption(f"⚡ CENACE PML Analyzer · Sebastian Roldan (SRF) · Recurrent Energy / Canadian Solar")
-
-v2 — Dashboard analítico con Plotly
