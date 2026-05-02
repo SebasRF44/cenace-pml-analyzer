@@ -7,7 +7,11 @@ Sebastian Roldan
 
 import streamlit as st
 import pandas as pd
+import numpy as np
 import requests
+import plotly.express as px
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 import json
 import urllib3
 import time
@@ -515,6 +519,267 @@ def generar_excel_datos(acumulado, sistema, proceso, fecha_ini, fecha_fin):
 
 
 # ═══════════════════════════════════════════════════════════════════════
+# DASHBOARD ANALÍTICO INLINE — v2 con Plotly
+# ═══════════════════════════════════════════════════════════════════════
+def acumulado_a_dataframe(acumulado, catalogo):
+    """Convierte el dict acumulado a un DataFrame plano para análisis."""
+    rows = []
+    for nodo, filas in acumulado.items():
+        info = catalogo.get(nodo, {}) if catalogo else {}
+        for f in filas:
+            try:
+                pml_val = float(f["pml"])
+            except (TypeError, ValueError):
+                continue
+            rows.append({
+                "nodo":      nodo,
+                "ccr":       info.get("ccr", "?"),
+                "nombre":    info.get("nombre", nodo),
+                "estado":    info.get("estado", ""),
+                "fecha":     f["fecha"],
+                "hora":      int(f["hora"]) if f["hora"] else 0,
+                "pml":       pml_val,
+            })
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df["fecha_dt"] = pd.to_datetime(df["fecha"], errors="coerce")
+        df["mes"] = df["fecha_dt"].dt.month
+        df["mes_nombre"] = df["fecha_dt"].dt.strftime("%b %Y")
+    return df
+
+
+def calcular_resumen(df):
+    """Tabla resumen estadística por nodo."""
+    if df.empty:
+        return pd.DataFrame()
+    summary = df.groupby("nodo").agg(
+        nombre=("nombre", "first"),
+        ccr=("ccr", "first"),
+        registros=("pml", "count"),
+        promedio=("pml", "mean"),
+        mediana=("pml", "median"),
+        maximo=("pml", "max"),
+        minimo=("pml", "min"),
+        std=("pml", "std"),
+    ).round(2)
+    # % de horas con precio negativo
+    pct_neg = df.groupby("nodo")["pml"].apply(
+        lambda x: (x < 0).sum() / len(x) * 100 if len(x) > 0 else 0
+    ).round(1)
+    summary["% horas neg"] = pct_neg
+    # P95 y P5
+    summary["p95"] = df.groupby("nodo")["pml"].quantile(0.95).round(2)
+    summary["p5"] = df.groupby("nodo")["pml"].quantile(0.05).round(2)
+    summary = summary.reset_index()
+    summary = summary.sort_values("promedio", ascending=False).reset_index(drop=True)
+    return summary
+
+
+def grafica_lineas_tiempo(df, max_nodos=15):
+    """Gráfica de línea: PML promedio diario por nodo."""
+    if df.empty:
+        return None
+    # Si hay muchos nodos, mostrar solo los top N por promedio
+    promedios = df.groupby("nodo")["pml"].mean().sort_values(ascending=False)
+    nodos_mostrar = promedios.head(max_nodos).index.tolist()
+    df_plot = df[df["nodo"].isin(nodos_mostrar)].copy()
+
+    # Agrupar por nodo y fecha → promedio diario
+    daily = df_plot.groupby(["nodo", "fecha_dt"])["pml"].mean().reset_index()
+
+    fig = px.line(
+        daily, x="fecha_dt", y="pml", color="nodo",
+        labels={"fecha_dt": "Fecha", "pml": "PML promedio diario ($/MWh)", "nodo": "Nodo"},
+        title=f"PML promedio diario · Top {len(nodos_mostrar)} nodos por precio promedio",
+    )
+    fig.update_layout(
+        hovermode="x unified",
+        height=450,
+        plot_bgcolor="#F8F9FA",
+        paper_bgcolor="white",
+        font=dict(family="Arial", size=11),
+        title_font_color="#0e346b",
+        legend=dict(orientation="v", yanchor="top", y=1, xanchor="left", x=1.02),
+    )
+    fig.update_xaxes(showgrid=True, gridcolor="#EBF3FB")
+    fig.update_yaxes(showgrid=True, gridcolor="#EBF3FB", zeroline=True, zerolinecolor="#a0090c")
+    return fig
+
+
+def grafica_heatmap_horario(df, nodo_seleccionado=None):
+    """Heatmap promedio PML por hora x mes para un nodo específico."""
+    if df.empty:
+        return None
+    if nodo_seleccionado is None:
+        # Tomar el nodo con mayor promedio
+        nodo_seleccionado = df.groupby("nodo")["pml"].mean().idxmax()
+
+    sub = df[df["nodo"] == nodo_seleccionado].copy()
+    if sub.empty:
+        return None
+
+    pivot = sub.pivot_table(values="pml", index="hora", columns="mes_nombre",
+                              aggfunc="mean").round(1)
+    # Ordenar columnas cronológicamente
+    if not pivot.empty:
+        meses_orden = sub.sort_values("fecha_dt")["mes_nombre"].drop_duplicates().tolist()
+        pivot = pivot.reindex(columns=meses_orden)
+
+    fig = go.Figure(data=go.Heatmap(
+        z=pivot.values,
+        x=pivot.columns,
+        y=pivot.index,
+        colorscale=[
+            [0.0, "#0e346b"],
+            [0.3, "#2777bd"],
+            [0.5, "#EBF3FB"],
+            [0.7, "#f5a653"],
+            [1.0, "#a0090c"],
+        ],
+        colorbar=dict(title="$/MWh"),
+        hovertemplate="Hora: %{y}<br>Mes: %{x}<br>PML: %{z} $/MWh<extra></extra>",
+    ))
+    fig.update_layout(
+        title=f"Heatmap PML hora × mes · {nodo_seleccionado}",
+        title_font_color="#0e346b",
+        height=450,
+        xaxis_title="Mes",
+        yaxis_title="Hora del día",
+        font=dict(family="Arial", size=11),
+    )
+    fig.update_yaxes(autorange="reversed", dtick=2)
+    return fig
+
+
+def grafica_barras_top(df, metrica="promedio", top_n=10):
+    """Top N nodos por una métrica específica."""
+    if df.empty:
+        return None
+    summary = df.groupby("nodo")["pml"].agg(["mean", "std", "max", "min"])
+    summary["pct_neg"] = df.groupby("nodo")["pml"].apply(
+        lambda x: (x < 0).sum() / len(x) * 100
+    )
+    summary = summary.reset_index()
+
+    if metrica == "promedio":
+        col = "mean"
+        titulo = f"Top {top_n} nodos · Mayor PML promedio"
+        color_bar = "#0e346b"
+    elif metrica == "volatilidad":
+        col = "std"
+        titulo = f"Top {top_n} nodos · Mayor volatilidad (std)"
+        color_bar = "#a0090c"
+    elif metrica == "negativos":
+        col = "pct_neg"
+        titulo = f"Top {top_n} nodos · Mayor % horas negativas"
+        color_bar = "#2777bd"
+    else:
+        return None
+
+    top = summary.nlargest(top_n, col)
+    fig = px.bar(
+        top, x=col, y="nodo", orientation="h",
+        labels={col: metrica.capitalize() + " ($/MWh)" if metrica != "negativos" else "% horas",
+                "nodo": ""},
+        title=titulo,
+    )
+    fig.update_traces(marker_color=color_bar)
+    fig.update_layout(
+        height=400,
+        plot_bgcolor="#F8F9FA",
+        paper_bgcolor="white",
+        font=dict(family="Arial", size=11),
+        title_font_color="#0e346b",
+        yaxis=dict(autorange="reversed"),
+    )
+    return fig
+
+
+def render_dashboard(acumulado, catalogo):
+    """Renderiza todo el dashboard analítico inline."""
+    st.divider()
+    st.markdown("## 📊 Dashboard analítico")
+    st.caption("Visualizaciones interactivas de los datos descargados — pasa el mouse sobre los gráficos para ver valores específicos.")
+
+    df = acumulado_a_dataframe(acumulado, catalogo)
+
+    if df.empty:
+        st.warning("No hay datos numéricos válidos para graficar.")
+        return
+
+    # ─── MÉTRICAS GLOBALES ───
+    col1, col2, col3, col4 = st.columns(4)
+    pml_global_prom = df["pml"].mean()
+    pml_global_max = df["pml"].max()
+    pct_neg_global = (df["pml"] < 0).sum() / len(df) * 100
+    nodo_top = df.groupby("nodo")["pml"].mean().idxmax()
+
+    col1.metric("PML promedio global", f"${pml_global_prom:.2f}")
+    col2.metric("PML máximo histórico", f"${pml_global_max:.2f}")
+    col3.metric("% horas negativas", f"{pct_neg_global:.1f}%")
+    col4.metric("Nodo con mayor PML", nodo_top)
+
+    # ─── TABLA RESUMEN ───
+    st.markdown("### 📋 Tabla resumen por nodo")
+    summary = calcular_resumen(df)
+    if not summary.empty:
+        st.dataframe(
+            summary,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "nodo": st.column_config.TextColumn("Clave", width="small"),
+                "nombre": st.column_config.TextColumn("Nombre", width="medium"),
+                "ccr": st.column_config.TextColumn("CCR", width="small"),
+                "registros": st.column_config.NumberColumn("# Reg", format="%d"),
+                "promedio": st.column_config.NumberColumn("Promedio", format="$%.2f"),
+                "mediana":  st.column_config.NumberColumn("Mediana", format="$%.2f"),
+                "maximo":   st.column_config.NumberColumn("Máximo", format="$%.2f"),
+                "minimo":   st.column_config.NumberColumn("Mínimo", format="$%.2f"),
+                "std":      st.column_config.NumberColumn("Volatilidad", format="$%.2f"),
+                "p95":      st.column_config.NumberColumn("P95", format="$%.2f"),
+                "p5":       st.column_config.NumberColumn("P5", format="$%.2f"),
+                "% horas neg": st.column_config.NumberColumn("% Neg", format="%.1f%%"),
+            },
+        )
+
+    # ─── GRÁFICA DE LÍNEAS ───
+    st.markdown("### 📈 Evolución temporal del PML")
+    max_lineas = min(15, len(acumulado))
+    fig_lineas = grafica_lineas_tiempo(df, max_nodos=max_lineas)
+    if fig_lineas:
+        st.plotly_chart(fig_lineas, use_container_width=True)
+
+    # ─── HEATMAP CON SELECTOR ───
+    st.markdown("### 🔥 Heatmap horario × mensual")
+    nodos_disponibles = sorted(df["nodo"].unique())
+    nodo_heatmap = st.selectbox(
+        "Selecciona un nodo para ver su patrón hora × mes:",
+        nodos_disponibles,
+        index=0,
+    )
+    fig_heat = grafica_heatmap_horario(df, nodo_heatmap)
+    if fig_heat:
+        st.plotly_chart(fig_heat, use_container_width=True)
+
+    # ─── TOPS COMPARATIVOS ───
+    st.markdown("### 🏆 Rankings comparativos")
+    tab1, tab2, tab3 = st.tabs(["Mayor PML", "Mayor volatilidad", "Más horas negativas"])
+    with tab1:
+        fig_top1 = grafica_barras_top(df, "promedio", top_n=min(10, len(acumulado)))
+        if fig_top1:
+            st.plotly_chart(fig_top1, use_container_width=True)
+    with tab2:
+        fig_top2 = grafica_barras_top(df, "volatilidad", top_n=min(10, len(acumulado)))
+        if fig_top2:
+            st.plotly_chart(fig_top2, use_container_width=True)
+    with tab3:
+        fig_top3 = grafica_barras_top(df, "negativos", top_n=min(10, len(acumulado)))
+        if fig_top3:
+            st.plotly_chart(fig_top3, use_container_width=True)
+
+
+# ═══════════════════════════════════════════════════════════════════════
 # UI PRINCIPAL
 # ═══════════════════════════════════════════════════════════════════════
 st.markdown(f"""
@@ -682,12 +947,15 @@ if boton and nodos and f_ini < f_fin:
                 type="primary"
             )
 
-            # Preview
-            with st.expander("👁️ Vista previa de datos (primeros nodos)"):
+            # Vista previa rápida
+            with st.expander("👁️ Vista previa de datos crudos (primeras filas)"):
                 for i, (nodo, filas) in enumerate(list(acumulado.items())[:3]):
                     st.markdown(f"**{nodo}** — {len(filas):,} registros")
                     df_prev = pd.DataFrame(filas[:10])
                     st.dataframe(df_prev, use_container_width=True)
+
+            # ─── DASHBOARD ANALÍTICO v2 ───
+            render_dashboard(acumulado, catalogo)
 
     except Exception as e:
         st.error(f"❌ Error inesperado: {type(e).__name__}: {str(e)}")
@@ -697,3 +965,5 @@ if boton and nodos and f_ini < f_fin:
 # ─────── FOOTER ───────
 st.divider()
 st.caption(f"⚡ CENACE PML Analyzer · Sebastian Roldan (SRF) · Recurrent Energy / Canadian Solar")
+
+v2 — Dashboard analítico con Plotly
