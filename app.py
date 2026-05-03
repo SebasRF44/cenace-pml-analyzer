@@ -3381,11 +3381,11 @@ with col_left:
 
     if n_nodos > 0:
         if es_solo_mapa:
-            # Modo Mapa permite hasta 2500 (es ligero)
-            if n_nodos > 2500:
+            # Modo Mapa permite hasta 2600 (es ligero)
+            if n_nodos > 2600:
                 st.error(
                     f"🔴 **{n_nodos} nodos** es demasiado para procesar incluso en modo Mapa. "
-                    f"Por estabilidad, sugiero dividir en consultas menores a 2500 nodos."
+                    f"Por estabilidad, sugiero dividir en consultas menores a 2600 nodos."
                 )
                 bloqueo_duro = True
             elif n_nodos > 500:
@@ -3401,7 +3401,7 @@ with col_left:
                     f"La app web puede colgarse por OOM (limite 1GB RAM en Streamlit Cloud Free). "
                     f"Sugiero dividir en consultas de 100-200 nodos. "
                     f"💡 Si solo quieres ver dónde están en el mapa, usa modo **🗺️ Mapa** "
-                    f"(soporta hasta 2500 nodos)."
+                    f"(soporta hasta 2600 nodos)."
                 )
                 bloqueo_duro = True
             elif n_nodos >= 100:
