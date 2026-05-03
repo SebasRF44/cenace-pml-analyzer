@@ -1,15 +1,13 @@
 """
-CENACE PML Analyzer — Streamlit Cloud Edition  v3
+CENACE PML Analyzer — Streamlit Cloud Edition  v4
 ======================================================
 Recurrent Energy / Canadian Solar — SRF · Sebastian Roldan
 
-v3 changes vs v2:
-- Mapa interactivo con Plotly Mapbox (OpenStreetMap)
-- Matching geográfico OSM con filtro por estado (de v64 notebook)
-- KMZ descargable como toggle opcional
-- Panel de stats por CCR
-- Colores corporativos mejorados para legibilidad
-- Heatmap con escala más clara (azul-blanco-rojo)
+v4 changes vs v3:
+- Labels y títulos negros para mejor legibilidad
+- Marcadores de mapa más grandes con borde blanco (pin-style)
+- 3 modos de uso: Solo mapa / Solo datos / Completo
+- BESS Scoring por caso de uso (Arbitraje / SSAA / Renewables Firming)
 """
 
 import streamlit as st
@@ -49,22 +47,26 @@ st.set_page_config(
 )
 
 # ═══════════════════════════════════════════════════════════════════════
-# COLORES CORPORATIVOS RE
+# COLORES — todos los textos en oscuro/negro para legibilidad
 # ═══════════════════════════════════════════════════════════════════════
-RE_NAVY  = "#0e346b"
-RE_RED   = "#a0090c"
-RE_BLUE  = "#2777bd"
-RE_ALT   = "#EBF3FB"
-RE_INFO  = "#D9E2F3"
+RE_NAVY     = "#0e346b"
+RE_RED      = "#a0090c"
+RE_BLUE     = "#2777bd"
+RE_ALT      = "#EBF3FB"
+RE_INFO     = "#D9E2F3"
+TEXT_DARK   = "#1a1a1a"   # Negro casi puro para todos los labels
+TEXT_TITLE  = "#0a2347"   # Navy más oscuro para títulos
+GRID_LIGHT  = "#D8D8D8"   # Más visible que antes
+AXIS_LINE   = "#444444"   # Ejes más oscuros
 
-# Paleta alta visibilidad para gráficas
+# Paleta alta visibilidad
 PALETTE = [
-    "#2777bd", "#a0090c", "#d4a017", "#4a8b3f", "#7e57c2",
-    "#ff7043", "#26a69a", "#ec407a", "#5c6bc0", "#8d6e63",
-    "#42a5f5", "#9ccc65", "#ffb74d", "#ab47bc", "#78909c",
+    "#0e346b", "#a0090c", "#d4a017", "#1a8a3a", "#7e57c2",
+    "#ff5722", "#00897b", "#c2185b", "#3949ab", "#5d4037",
+    "#1976d2", "#558b2f", "#f57c00", "#8e24aa", "#455a64",
 ]
 
-# Colores para openpyxl (sin #)
+# Colores para openpyxl
 C_HEADER = "0e346b"
 C_SUB    = "2777bd"
 C_RED    = "a0090c"
@@ -89,6 +91,11 @@ st.markdown(f"""
         background: {RE_NAVY}; color: white; border: none;
     }}
     .stButton > button[kind="primary"]:hover {{ background: {RE_RED}; }}
+    .mode-badge {{
+        background: #f0f4f8; border-left: 4px solid {RE_NAVY};
+        padding: 0.6rem 1rem; border-radius: 4px; margin-bottom: 1rem;
+        color: {TEXT_DARK}; font-size: 0.9rem;
+    }}
 </style>
 """, unsafe_allow_html=True)
 
@@ -109,7 +116,7 @@ OSM_HEADERS = {
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# CARGAR CATÁLOGO CENACE
+# CARGAR CATÁLOGO
 # ═══════════════════════════════════════════════════════════════════════
 @st.cache_data
 def cargar_catalogo():
@@ -138,18 +145,15 @@ def cargar_catalogo():
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# OSM — DESCARGA + CACHE 7 DIAS
+# OSM
 # ═══════════════════════════════════════════════════════════════════════
 @st.cache_data(show_spinner=False, ttl=86400 * 7)
 def cargar_osm_subestaciones():
-    """Descarga subestaciones OSM México. Cache 7 días."""
-    # Si ya está en repo, leerlo
     osm_local = os.path.join(os.path.dirname(__file__), 'data', 'osm_subestaciones_mx.json')
     if os.path.exists(osm_local):
         with open(osm_local, 'r', encoding='utf-8') as f:
             return json.load(f)
 
-    # Descargar de Overpass
     query = """
 [out:json][timeout:180];
 area["ISO3166-1"="MX"]->.mx;
@@ -180,14 +184,12 @@ out center tags;
             for ch in p:
                 if ch.isdigit() or ch == '.':
                     num_str += ch
-                else:
-                    break
+                else: break
             if num_str:
                 try:
                     n = float(num_str)
                     nums.append(n / 1000 if n >= 1000 else n)
-                except:
-                    pass
+                except: pass
         return max(nums) if nums else None
 
     subs = []
@@ -201,28 +203,24 @@ out center tags;
             lat_e = el.get('lat', 0); lon_e = el.get('lon', 0)
         elif 'center' in el:
             lat_e = el['center'].get('lat', 0); lon_e = el['center'].get('lon', 0)
-        else:
-            continue
-        if lat_e == 0 and lon_e == 0:
-            continue
+        else: continue
+        if lat_e == 0 and lon_e == 0: continue
         v_kv = _parse_voltaje_max(tags.get('voltage', ''))
         subs.append({
-            'osm_id':    el['id'],
-            'osm_type':  el['type'],
-            'lat':       round(lat_e, 6),
-            'lon':       round(lon_e, 6),
-            'name':      tags.get('name', ''),
-            'operator':  tags.get('operator', ''),
+            'osm_id': el['id'], 'osm_type': el['type'],
+            'lat': round(lat_e, 6), 'lon': round(lon_e, 6),
+            'name': tags.get('name', ''),
+            'operator': tags.get('operator', ''),
             'voltage_kv': v_kv,
             'voltage_raw': tags.get('voltage', ''),
             'substation': sub_type,
-            'rating':     tags.get('rating', ''),
+            'rating': tags.get('rating', ''),
         })
     return subs
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# MATCHING GEOGRÁFICO (de v64)
+# MATCHING GEOGRÁFICO
 # ═══════════════════════════════════════════════════════════════════════
 BBOX_ESTADO = {
     'AGUASCALIENTES':       (21.62, -102.87, 22.45, -101.84),
@@ -346,7 +344,6 @@ def buscar_match(nombre_cenace, voltaje_cenace_kv, estado_cat, candidatos):
     if not nombre_norm:
         return None, 0.0, 'sin nombre'
 
-    # 1. exacto
     exactos = [s for s in candidatos if s['name_norm'] == nombre_norm]
     if exactos:
         if estado_cat:
@@ -364,7 +361,6 @@ def buscar_match(nombre_cenace, voltaje_cenace_kv, estado_cat, candidatos):
                     return con_v[0], 1.0, 'match exacto + voltaje'
             return exactos[0], 1.0, 'match exacto'
 
-    # 2. substring
     substring_matches = []
     for s in candidatos:
         n_osm = s['name_norm']
@@ -383,33 +379,26 @@ def buscar_match(nombre_cenace, voltaje_cenace_kv, estado_cat, candidatos):
                 if cob >= 0.40:
                     substring_matches.append((0.90, s, 'CENACE extiende OSM'))
 
-    # 3. difuso
     difusos = []
     for s in candidatos:
         sim = similitud(nombre_norm, s['name_norm'])
         if sim >= 0.80:
             difusos.append((sim, s))
 
-    # 4. keyword
     kw_cenace = palabras_clave(nombre_norm)
     keyword_matches = []
     if kw_cenace:
         for s in candidatos:
             kw_osm = palabras_clave(s.get('name_norm', ''))
-            if not kw_osm:
-                continue
+            if not kw_osm: continue
             compartidas = set(kw_cenace) & set(kw_osm)
-            if not compartidas:
-                continue
+            if not compartidas: continue
             todas_semi = all(p in PALABRAS_SEMIGENERICAS for p in compartidas)
             largas_no_semi = sum(1 for p in compartidas
                                  if len(p) >= 6 and p not in PALABRAS_SEMIGENERICAS)
-            if todas_semi:
-                base_score = 0.62
-            elif largas_no_semi >= 1:
-                base_score = 0.78
-            else:
-                base_score = 0.70
+            if todas_semi: base_score = 0.62
+            elif largas_no_semi >= 1: base_score = 0.78
+            else: base_score = 0.70
             ratio = len(compartidas) / max((len(kw_cenace) + len(kw_osm)) / 2, 1)
             score = base_score + (ratio * 0.12)
             keyword_matches.append((score, s, list(compartidas)))
@@ -487,14 +476,10 @@ def matchear_nodos(nodos, catalogo, osm_subs):
         match, sim, razon = buscar_match(nombre, kv, estado, candidatos)
 
         if match:
-            if 'palabra-clave' in razon:
-                calidad = '🥉 Aceptable'
-            elif sim >= 0.95:
-                calidad = '🥇 Excelente'
-            elif sim >= 0.90:
-                calidad = '🥈 Bueno'
-            else:
-                calidad = '🥉 Aceptable'
+            if 'palabra-clave' in razon: calidad = '🥉 Aceptable'
+            elif sim >= 0.95: calidad = '🥇 Excelente'
+            elif sim >= 0.90: calidad = '🥈 Bueno'
+            else: calidad = '🥉 Aceptable'
         else:
             calidad = '❌ Sin match'
 
@@ -545,7 +530,7 @@ def consultar(nodos_lista, fecha_ini, fecha_fin, sistema, proceso,
         with lock:
             errores_lista.append({"fecha": f"{fecha_ini} → {fecha_fin}",
                                    "nodos": len(nodos_lista),
-                                   "error": f"URL muy larga ({len(url)})"})
+                                   "error": f"URL muy larga"})
         return None
     session = requests.Session(); session.verify = False
     for intento in range(max_reintentos):
@@ -734,7 +719,6 @@ def generar_excel_datos(acumulado, sistema, proceso, fecha_ini, fecha_fin):
                    ("E", 14), ("F", 14), ("G", 14), ("H", 14), ("I", 3)]:
         ws.column_dimensions[col].width = w
 
-    # Resumen
     ws_res = wb.create_sheet("Resumen")
     ws_res.merge_cells("A1:F1")
     c = ws_res["A1"]; c.value = f"Resumen — {len(acumulado)} nodos · {sistema} · {proceso}"
@@ -770,7 +754,6 @@ def generar_excel_datos(acumulado, sistema, proceso, fecha_ini, fecha_fin):
         ws_res.column_dimensions[get_column_letter(ci)].width = w
     ws_res.freeze_panes = "A3"
 
-    # Por nodo
     for nodo, filas in acumulado.items():
         ws_n = wb.create_sheet(title=nodo[:31])
         ws_n.merge_cells("A1:F1")
@@ -949,6 +932,41 @@ def calcular_resumen(df):
     return summary.reset_index().sort_values("promedio", ascending=False).reset_index(drop=True)
 
 
+# Layout estándar para todas las gráficas (labels negros, alta legibilidad)
+def _layout_estandar(titulo, height=480):
+    return dict(
+        title=dict(
+            text=titulo,
+            font=dict(family="Arial Black", size=16, color=TEXT_TITLE),
+            x=0.02, xanchor="left",
+        ),
+        height=height,
+        plot_bgcolor="white",
+        paper_bgcolor="white",
+        font=dict(family="Arial", size=12, color=TEXT_DARK),  # ← Color principal
+        margin=dict(l=70, r=40, t=70, b=60),
+        hoverlabel=dict(bgcolor="white", font_size=12, font_color=TEXT_DARK,
+                        bordercolor=AXIS_LINE),
+    )
+
+
+def _ejes_estandar(fig, x_title=None, y_title=None, y_dollar=True):
+    fig.update_xaxes(
+        showgrid=True, gridcolor=GRID_LIGHT,
+        linecolor=AXIS_LINE, linewidth=1.5,
+        tickfont=dict(family="Arial", size=11, color=TEXT_DARK),
+        title=dict(text=x_title or "", font=dict(family="Arial", size=13, color=TEXT_DARK)),
+    )
+    fig.update_yaxes(
+        showgrid=True, gridcolor=GRID_LIGHT,
+        linecolor=AXIS_LINE, linewidth=1.5,
+        tickfont=dict(family="Arial", size=11, color=TEXT_DARK),
+        title=dict(text=y_title or "", font=dict(family="Arial", size=13, color=TEXT_DARK)),
+        zeroline=True, zerolinecolor=RE_RED, zerolinewidth=1.5,
+    )
+    return fig
+
+
 def grafica_lineas_tiempo(df, max_nodos=15):
     if df.empty: return None
     promedios = df.groupby("nodo")["pml"].mean().sort_values(ascending=False)
@@ -957,26 +975,23 @@ def grafica_lineas_tiempo(df, max_nodos=15):
     daily = df_plot.groupby(["nodo", "fecha_dt"])["pml"].mean().reset_index()
     fig = px.line(
         daily, x="fecha_dt", y="pml", color="nodo",
-        labels={"fecha_dt": "Fecha", "pml": "PML promedio diario ($/MWh)", "nodo": "Nodo"},
-        title=f"PML promedio diario · Top {len(nodos_mostrar)} nodos",
         color_discrete_sequence=PALETTE,
     )
-    fig.update_traces(line=dict(width=2.2))
+    fig.update_traces(line=dict(width=2.5), mode='lines')
+    fig.update_layout(**_layout_estandar(
+        f"Evolución temporal · Top {len(nodos_mostrar)} nodos por PML promedio"))
     fig.update_layout(
         hovermode="x unified",
-        height=480,
-        plot_bgcolor="white",
-        paper_bgcolor="white",
-        font=dict(family="Arial", size=12, color="#222"),
-        title_font_color=RE_NAVY, title_font_size=15,
-        legend=dict(orientation="v", yanchor="top", y=1, xanchor="left", x=1.02,
-                    bgcolor="rgba(255,255,255,0.9)", bordercolor="#cccccc", borderwidth=1),
-        margin=dict(l=60, r=180, t=60, b=50),
+        legend=dict(
+            orientation="v", yanchor="top", y=1, xanchor="left", x=1.02,
+            bgcolor="rgba(255,255,255,0.95)",
+            bordercolor=AXIS_LINE, borderwidth=1,
+            font=dict(family="Arial", size=11, color=TEXT_DARK),
+            title=dict(text="<b>Nodo</b>", font=dict(color=TEXT_DARK)),
+        ),
+        margin=dict(l=70, r=200, t=70, b=60),
     )
-    fig.update_xaxes(showgrid=True, gridcolor="#E0E0E0", linecolor="#888")
-    fig.update_yaxes(showgrid=True, gridcolor="#E0E0E0", linecolor="#888",
-                      zeroline=True, zerolinecolor="#a0090c", zerolinewidth=1.5)
-    return fig
+    return _ejes_estandar(fig, "Fecha", "PML promedio diario ($/MWh)")
 
 
 def grafica_heatmap_horario(df, nodo_seleccionado):
@@ -994,27 +1009,28 @@ def grafica_heatmap_horario(df, nodo_seleccionado):
         [0.75, "#f5a653"], [1.0, "#a0090c"],
     ]
     fig = go.Figure(data=go.Heatmap(
-        z=pivot.values,
-        x=pivot.columns,
-        y=pivot.index,
+        z=pivot.values, x=pivot.columns, y=pivot.index,
         colorscale=colorscale,
         zmid=pivot.values.mean() if pivot.size > 0 else 0,
-        colorbar=dict(title="$/MWh", thickness=15, len=0.8),
-        hovertemplate="Hora: %{y}h<br>Mes: %{x}<br>PML: $%{z}<extra></extra>",
+        colorbar=dict(
+            title=dict(text="$/MWh", font=dict(color=TEXT_DARK, size=12)),
+            thickness=15, len=0.85,
+            tickfont=dict(color=TEXT_DARK, size=11),
+        ),
+        hovertemplate="<b>Hora:</b> %{y}h<br><b>Mes:</b> %{x}<br><b>PML:</b> $%{z}<extra></extra>",
         text=pivot.values,
         texttemplate="%{text:.0f}",
-        textfont=dict(size=9, color="#222"),
+        textfont=dict(size=10, color=TEXT_DARK, family="Arial Black"),
     ))
-    fig.update_layout(
-        title=f"Heatmap PML hora × mes · {nodo_seleccionado}",
-        title_font_color=RE_NAVY, title_font_size=15,
-        height=520,
-        xaxis_title="Mes", yaxis_title="Hora del día",
-        font=dict(family="Arial", size=12, color="#222"),
-        plot_bgcolor="white", paper_bgcolor="white",
-    )
-    fig.update_yaxes(autorange="reversed", dtick=2, linecolor="#888")
-    fig.update_xaxes(linecolor="#888")
+    fig.update_layout(**_layout_estandar(
+        f"Heatmap PML hora × mes · {nodo_seleccionado}", height=540))
+    fig.update_yaxes(autorange="reversed", dtick=2,
+                      linecolor=AXIS_LINE, linewidth=1.5,
+                      tickfont=dict(family="Arial", size=11, color=TEXT_DARK),
+                      title=dict(text="Hora del día", font=dict(family="Arial", size=13, color=TEXT_DARK)))
+    fig.update_xaxes(linecolor=AXIS_LINE, linewidth=1.5,
+                      tickfont=dict(family="Arial", size=11, color=TEXT_DARK),
+                      title=dict(text="Mes", font=dict(family="Arial", size=13, color=TEXT_DARK)))
     return fig
 
 
@@ -1026,60 +1042,247 @@ def grafica_barras_top(df, metrica="promedio", top_n=10):
     if metrica == "promedio":
         col, titulo, color_bar = "mean", f"Top {top_n} · Mayor PML promedio", RE_NAVY
     elif metrica == "volatilidad":
-        col, titulo, color_bar = "std", f"Top {top_n} · Mayor volatilidad (std)", RE_RED
+        col, titulo, color_bar = "std", f"Top {top_n} · Mayor volatilidad", RE_RED
     elif metrica == "negativos":
         col, titulo, color_bar = "pct_neg", f"Top {top_n} · Más horas negativas", RE_BLUE
     else: return None
-    top = summary.nlargest(top_n, col)
-    fig = px.bar(
-        top, x=col, y="nodo", orientation="h",
-        labels={col: metrica.capitalize() + " ($/MWh)" if metrica != "negativos" else "% horas",
-                "nodo": ""},
-        title=titulo,
-    )
-    fig.update_traces(marker_color=color_bar)
-    fig.update_layout(
-        height=420,
-        plot_bgcolor="white", paper_bgcolor="white",
-        font=dict(family="Arial", size=12, color="#222"),
-        title_font_color=RE_NAVY, title_font_size=15,
-        yaxis=dict(autorange="reversed"),
-    )
-    fig.update_xaxes(showgrid=True, gridcolor="#E0E0E0", linecolor="#888")
-    fig.update_yaxes(linecolor="#888")
-    return fig
+    top = summary.nlargest(top_n, col).round(2)
+
+    # Texto en negro arriba de cada barra
+    text_template = "%{x:.2f}" if metrica != "negativos" else "%{x:.1f}%"
+
+    fig = go.Figure()
+    fig.add_trace(go.Bar(
+        x=top[col], y=top["nodo"],
+        orientation='h',
+        marker=dict(color=color_bar, line=dict(color=TEXT_DARK, width=1)),
+        text=top[col],
+        texttemplate=text_template,
+        textposition='outside',
+        textfont=dict(family="Arial Black", size=11, color=TEXT_DARK),
+        hovertemplate=f"<b>%{{y}}</b><br>{metrica.capitalize()}: %{{x:.2f}}<extra></extra>",
+    ))
+    fig.update_layout(**_layout_estandar(titulo, height=440))
+    fig.update_layout(yaxis=dict(autorange="reversed"))
+    x_title = metrica.capitalize() + " ($/MWh)" if metrica != "negativos" else "% de horas"
+    return _ejes_estandar(fig, x_title, "")
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# MAPA INTERACTIVO
+# BESS SCORING (rank-percentile, igual que v64)
 # ═══════════════════════════════════════════════════════════════════════
-def grafica_mapa(matches_df, df_pml):
+# Pesos por defecto por caso de uso
+PESOS_BESS = {
+    'Arbitraje': {
+        'spread_p95_p5':    0.30,  # Diferencia P95-P5 (oportunidad arbitraje)
+        'spread_avg_diario': 0.25,  # Spread día promedio (max-min)
+        'volatilidad':      0.20,
+        'horas_pico':       0.15,  # Veces que toca tope alto
+        'pml_promedio':     0.10,
+    },
+    'Servicios Auxiliares': {
+        'volatilidad':      0.40,  # SSAA paga la volatilidad
+        'cambios_bruscos':  0.30,  # # de cambios horarios fuertes
+        'pml_promedio':     0.15,
+        'spread_p95_p5':    0.15,
+    },
+    'Renewables Firming': {
+        'pct_horas_neg':    0.35,  # Buena oportunidad de cargar barato
+        'spread_dia':       0.30,  # Diferencia inyección día/noche
+        'spread_p95_p5':    0.20,
+        'pml_promedio':     0.15,
+    },
+}
+
+DESCRIPCIONES_USE_CASE = {
+    'Arbitraje': '💰 **Arbitraje energético** — Comprar barato, vender caro. '
+                  'Premia spread alto, volatilidad y picos de precio.',
+    'Servicios Auxiliares': '⚙️ **Servicios Auxiliares (SSAA)** — Regulación de '
+                             'frecuencia y voltaje. Premia volatilidad y cambios '
+                             'bruscos en el precio.',
+    'Renewables Firming': '🌅 **Firming de Renovables** — Acompañar generación solar/eólica. '
+                           'Premia horas con precios negativos (carga barata) y '
+                           'diferencial día-noche.',
+}
+
+
+def calcular_metricas_bess(df):
+    """Calcula métricas raw por nodo. Retorna DataFrame."""
+    if df.empty: return pd.DataFrame()
+
+    metricas = []
+    for nodo in df["nodo"].unique():
+        sub = df[df["nodo"] == nodo].copy()
+        pml = sub["pml"].values
+        if len(pml) == 0: continue
+
+        # Métricas básicas
+        prom = pml.mean()
+        std_v = pml.std()
+        p95 = np.percentile(pml, 95)
+        p5  = np.percentile(pml, 5)
+        spread_p95_p5 = p95 - p5
+
+        # Spread día promedio (max-min por día)
+        sub["fecha_only"] = sub["fecha_dt"].dt.date
+        daily = sub.groupby("fecha_only")["pml"].agg(['min', 'max', 'mean'])
+        daily["spread"] = daily["max"] - daily["min"]
+        spread_avg_diario = daily["spread"].mean() if not daily.empty else 0
+        spread_dia = daily["max"].mean() - daily["min"].mean() if not daily.empty else 0
+
+        # Cambios bruscos hora-a-hora
+        sub_sorted = sub.sort_values(["fecha_dt", "hora"])
+        diffs = sub_sorted["pml"].diff().abs()
+        threshold = std_v * 1.5 if std_v > 0 else 0
+        cambios_bruscos = (diffs > threshold).sum()
+
+        # Horas pico
+        threshold_pico = p95
+        horas_pico = (pml > threshold_pico).sum()
+
+        # % horas negativas
+        pct_neg = (pml < 0).mean() * 100
+
+        info = catalogo.get(nodo, {}) if 'catalogo' in dir() else {}
+        metricas.append({
+            'nodo':          nodo,
+            'pml_promedio':  round(prom, 2),
+            'volatilidad':   round(std_v, 2),
+            'spread_p95_p5': round(spread_p95_p5, 2),
+            'spread_avg_diario': round(spread_avg_diario, 2),
+            'spread_dia':    round(spread_dia, 2),
+            'cambios_bruscos': int(cambios_bruscos),
+            'horas_pico':    int(horas_pico),
+            'pct_horas_neg': round(pct_neg, 1),
+        })
+
+    return pd.DataFrame(metricas)
+
+
+def calcular_score_bess(df_metricas, use_case, pesos=None):
+    """Calcula score BESS usando rank-percentile (mismo que v64).
+    
+    Cada métrica se rankea entre 0 y 1 (mejor=1, peor=0), luego se pondera.
+    """
+    if df_metricas.empty: return pd.DataFrame()
+    if pesos is None: pesos = PESOS_BESS.get(use_case, PESOS_BESS['Arbitraje'])
+
+    df = df_metricas.copy()
+
+    # Para cada métrica usada, calcular rank-percentile
+    # Mayor valor = mejor para todas las métricas usadas
+    score = pd.Series(0.0, index=df.index)
+    for metrica, peso in pesos.items():
+        if metrica not in df.columns: continue
+        # Rank-percentile: 0=peor, 1=mejor
+        ranks = df[metrica].rank(pct=True, method='average')
+        score += ranks * peso
+
+    df['score'] = (score * 100).round(1)  # 0-100
+    return df.sort_values('score', ascending=False).reset_index(drop=True)
+
+
+def grafica_bess_ranking(df_score, use_case, top_n=15):
+    """Gráfica de barras horizontales con scores BESS."""
+    if df_score.empty: return None
+    top = df_score.nlargest(top_n, 'score').copy()
+
+    # Color por percentil del score
+    colors = []
+    for s in top['score']:
+        if s >= 75: colors.append("#1a8a3a")     # Verde — top
+        elif s >= 50: colors.append("#9bc24f")
+        elif s >= 25: colors.append("#f5d017")   # Amarillo — medio
+        else: colors.append("#a0090c")            # Rojo — bajo
+
+    fig = go.Figure()
+    fig.add_trace(go.Bar(
+        x=top['score'], y=top['nodo'],
+        orientation='h',
+        marker=dict(color=colors, line=dict(color=TEXT_DARK, width=1)),
+        text=top['score'],
+        texttemplate="%{x:.1f}",
+        textposition='outside',
+        textfont=dict(family="Arial Black", size=12, color=TEXT_DARK),
+        hovertemplate="<b>%{y}</b><br>Score BESS: <b>%{x:.1f}</b>/100<extra></extra>",
+    ))
+    fig.update_layout(**_layout_estandar(
+        f"🏆 Top {top_n} nodos · Score BESS para {use_case}", height=520))
+    fig.update_layout(yaxis=dict(autorange="reversed"))
+    return _ejes_estandar(fig, "Score BESS (0-100)", "")
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# MAPA INTERACTIVO — pin-style markers
+# ═══════════════════════════════════════════════════════════════════════
+def grafica_mapa(matches_df, df_pml=None, color_by='pml'):
+    """color_by: 'pml' (con datos) o 'ccr' (modo solo mapa)."""
     matches_ok = matches_df[matches_df['lat'].notna()].copy()
     if matches_ok.empty:
         return None
 
-    pml_avg = df_pml.groupby('nodo')['pml'].agg(['mean', 'count', 'max', 'min']).reset_index()
-    pml_avg.columns = ['clave', 'pml_avg', 'pml_count', 'pml_max', 'pml_min']
-    map_df = matches_ok.merge(pml_avg, on='clave', how='left')
+    if color_by == 'pml' and df_pml is not None and not df_pml.empty:
+        pml_avg = df_pml.groupby('nodo')['pml'].agg(['mean', 'count', 'max', 'min']).reset_index()
+        pml_avg.columns = ['clave', 'pml_avg', 'pml_count', 'pml_max', 'pml_min']
+        map_df = matches_ok.merge(pml_avg, on='clave', how='left')
 
-    # Hover
-    map_df['hover'] = map_df.apply(
-        lambda r: (
-            f"<b>{r['clave']}</b><br>"
-            f"<b>Nombre:</b> {r['nombre_cenace']}<br>"
-            f"<b>CCR:</b> {r['ccr']} · {r['zona']}<br>"
-            f"<b>Voltaje:</b> {r['kv_cenace']} kV<br>"
-            f"<b>Estado:</b> {r['estado']}<br>"
-            f"<b>Municipio:</b> {r['municipio']}<br>"
-            f"━━━━━━━━━━━<br>"
-            f"<b>PML promedio:</b> ${r['pml_avg']:.2f}<br>"
-            f"<b>PML máx:</b> ${r['pml_max']:.2f}<br>"
-            f"<b>PML mín:</b> ${r['pml_min']:.2f}<br>"
-            f"━━━━━━━━━━━<br>"
-            f"<b>Match:</b> {r['calidad']} (sim {r['similitud']})<br>"
-            f"<b>OSM:</b> {r['nombre_osm']}"
-        ), axis=1
-    )
+        map_df['hover'] = map_df.apply(
+            lambda r: (
+                f"<b>{r['clave']}</b><br>"
+                f"<b>Nombre:</b> {r['nombre_cenace']}<br>"
+                f"<b>CCR:</b> {r['ccr']} · {r['zona']}<br>"
+                f"<b>Voltaje:</b> {r['kv_cenace']} kV<br>"
+                f"<b>Estado:</b> {r['estado']}<br>"
+                f"<b>Municipio:</b> {r['municipio']}<br>"
+                f"━━━━━━━━━━━<br>"
+                f"<b>PML promedio:</b> ${r['pml_avg']:.2f}<br>"
+                f"<b>PML máx:</b> ${r['pml_max']:.2f}<br>"
+                f"<b>PML mín:</b> ${r['pml_min']:.2f}<br>"
+                f"━━━━━━━━━━━<br>"
+                f"<b>Match:</b> {r['calidad']} (sim {r['similitud']})<br>"
+                f"<b>OSM:</b> {r['nombre_osm']}"
+            ), axis=1
+        )
+        marker_color = map_df['pml_avg']
+        cmin = map_df['pml_avg'].min()
+        cmax = map_df['pml_avg'].max()
+        colorscale = [
+            [0.0, "#1a8a3a"], [0.25, "#9bc24f"], [0.5, "#f5d017"],
+            [0.75, "#f57f17"], [1.0, "#a0090c"],
+        ]
+        colorbar = dict(
+            title=dict(text="<b>PML promedio<br>($/MWh)</b>",
+                       font=dict(family="Arial", size=12, color=TEXT_DARK)),
+            thickness=18, len=0.7, x=1.02,
+            tickfont=dict(family="Arial", size=11, color=TEXT_DARK),
+        )
+        showscale = True
+    else:
+        # Modo solo mapa: colorear por CCR
+        map_df = matches_ok.copy()
+        ccrs_unique = sorted(map_df['ccr'].fillna('?').unique())
+        ccr_to_color = {c: PALETTE[i % len(PALETTE)] for i, c in enumerate(ccrs_unique)}
+
+        map_df['hover'] = map_df.apply(
+            lambda r: (
+                f"<b>{r['clave']}</b><br>"
+                f"<b>Nombre:</b> {r['nombre_cenace']}<br>"
+                f"<b>CCR:</b> {r['ccr']} · {r['zona']}<br>"
+                f"<b>Voltaje:</b> {r['kv_cenace']} kV<br>"
+                f"<b>Estado:</b> {r['estado']}<br>"
+                f"<b>Municipio:</b> {r['municipio']}<br>"
+                f"━━━━━━━━━━━<br>"
+                f"<b>Match:</b> {r['calidad']} (sim {r['similitud']})<br>"
+                f"<b>OSM:</b> {r['nombre_osm']}<br>"
+                f"<i>(modo solo mapa — sin datos PML)</i>"
+            ), axis=1
+        )
+        map_df['color_ccr'] = map_df['ccr'].fillna('?').map(ccr_to_color)
+        marker_color = map_df['color_ccr']
+        cmin = cmax = None
+        colorscale = None
+        colorbar = None
+        showscale = False
 
     # Auto-zoom
     lat_min, lat_max = map_df['lat'].min(), map_df['lat'].max()
@@ -1087,43 +1290,77 @@ def grafica_mapa(matches_df, df_pml):
     lat_center = (lat_min + lat_max) / 2
     lon_center = (lon_min + lon_max) / 2
     spread = max(lat_max - lat_min, lon_max - lon_min)
-    if spread > 15:    zoom = 4
-    elif spread > 8:   zoom = 5
-    elif spread > 4:   zoom = 6
-    elif spread > 2:   zoom = 7
-    elif spread > 1:   zoom = 8
-    else:              zoom = 9
+    if spread > 15: zoom = 4
+    elif spread > 8: zoom = 5
+    elif spread > 4: zoom = 6
+    elif spread > 2: zoom = 7
+    elif spread > 1: zoom = 8
+    else: zoom = 9
 
     fig = go.Figure()
+
+    # Capa 1: halo blanco grande (background)
     fig.add_trace(go.Scattermapbox(
         lat=map_df['lat'],
         lon=map_df['lon'],
-        mode='markers+text',
-        marker=dict(
-            size=14,
-            color=map_df['pml_avg'],
-            colorscale=[
-                [0.0, "#1a8a3a"],
-                [0.25, "#9bc24f"],
-                [0.5, "#f5d017"],
-                [0.75, "#f57f17"],
-                [1.0, "#a0090c"],
-            ],
-            cmin=map_df['pml_avg'].min(),
-            cmax=map_df['pml_avg'].max(),
-            colorbar=dict(
-                title="PML<br>promedio<br>($/MWh)",
-                thickness=15, len=0.7, x=1.02,
-            ),
-            opacity=0.92,
-        ),
-        text=map_df['clave'],
-        textposition="top center",
-        textfont=dict(size=10, color=RE_NAVY, family="Arial"),
-        hovertext=map_df['hover'],
-        hoverinfo='text',
-        name='Nodos CENACE',
+        mode='markers',
+        marker=dict(size=28, color='white', opacity=0.95),
+        hoverinfo='skip',
+        showlegend=False,
     ))
+
+    # Capa 2: marker principal con color y borde
+    if color_by == 'pml' and showscale:
+        fig.add_trace(go.Scattermapbox(
+            lat=map_df['lat'],
+            lon=map_df['lon'],
+            mode='markers+text',
+            marker=dict(
+                size=20,
+                color=marker_color,
+                colorscale=colorscale,
+                cmin=cmin, cmax=cmax,
+                colorbar=colorbar,
+                showscale=True,
+                opacity=0.95,
+            ),
+            text=map_df['clave'],
+            textposition="top right",
+            textfont=dict(size=11, color=TEXT_TITLE, family="Arial Black"),
+            hovertext=map_df['hover'],
+            hoverinfo='text',
+            name='Nodos',
+        ))
+    else:
+        fig.add_trace(go.Scattermapbox(
+            lat=map_df['lat'],
+            lon=map_df['lon'],
+            mode='markers+text',
+            marker=dict(
+                size=20,
+                color=marker_color,
+                opacity=0.95,
+            ),
+            text=map_df['clave'],
+            textposition="top right",
+            textfont=dict(size=11, color=TEXT_TITLE, family="Arial Black"),
+            hovertext=map_df['hover'],
+            hoverinfo='text',
+            name='Nodos',
+        ))
+
+    # Capa 3: punto central pequeño negro
+    fig.add_trace(go.Scattermapbox(
+        lat=map_df['lat'],
+        lon=map_df['lon'],
+        mode='markers',
+        marker=dict(size=4, color=TEXT_DARK, opacity=1.0),
+        hoverinfo='skip',
+        showlegend=False,
+    ))
+
+    titulo_mapa = (f"📍 Mapa interactivo · {len(map_df)} nodos · "
+                   f"{'colores por PML' if color_by == 'pml' else 'colores por CCR'}")
 
     fig.update_layout(
         mapbox=dict(
@@ -1131,48 +1368,155 @@ def grafica_mapa(matches_df, df_pml):
             center=dict(lat=lat_center, lon=lon_center),
             zoom=zoom,
         ),
-        height=650,
-        margin=dict(l=0, r=0, t=40, b=0),
+        height=680,
+        margin=dict(l=0, r=0, t=50, b=0),
         title=dict(
-            text=f"📍 Mapa interactivo · {len(map_df)} nodos · pasa el mouse para ver detalles",
-            font=dict(color=RE_NAVY, size=15, family="Arial"),
+            text=titulo_mapa,
+            font=dict(family="Arial Black", size=16, color=TEXT_TITLE),
+            x=0.02, xanchor="left",
         ),
         showlegend=False,
         paper_bgcolor="white",
+        hoverlabel=dict(bgcolor="white", font_size=12, font_color=TEXT_DARK,
+                        bordercolor=AXIS_LINE),
     )
     return fig
 
 
-def render_panel_ccr(matches_df, df_pml):
+def render_panel_ccr(matches_df, df_pml=None):
     matches_ok = matches_df[matches_df['lat'].notna()].copy()
     if matches_ok.empty: return
 
-    pml_avg_nodo = df_pml.groupby('nodo')['pml'].mean().reset_index()
-    pml_avg_nodo.columns = ['clave', 'pml_avg']
-    merged = matches_ok.merge(pml_avg_nodo, on='clave', how='left')
+    if df_pml is not None and not df_pml.empty:
+        pml_avg_nodo = df_pml.groupby('nodo')['pml'].mean().reset_index()
+        pml_avg_nodo.columns = ['clave', 'pml_avg']
+        merged = matches_ok.merge(pml_avg_nodo, on='clave', how='left')
 
-    ccr_stats = merged.groupby('ccr').agg(
-        nodos=('clave', 'count'),
-        pml_promedio=('pml_avg', 'mean'),
-        pml_max=('pml_avg', 'max'),
-        pml_min=('pml_avg', 'min'),
-    ).round(2).reset_index().sort_values('pml_promedio', ascending=False)
+        ccr_stats = merged.groupby('ccr').agg(
+            nodos=('clave', 'count'),
+            pml_promedio=('pml_avg', 'mean'),
+            pml_max=('pml_avg', 'max'),
+            pml_min=('pml_avg', 'min'),
+        ).round(2).reset_index().sort_values('pml_promedio', ascending=False)
 
-    st.markdown("##### 📊 Promedio por CCR (zonas analizadas)")
+        st.markdown("##### 📊 Promedio por CCR (zonas analizadas)")
+        st.dataframe(
+            ccr_stats, use_container_width=True, hide_index=True,
+            column_config={
+                "ccr":          st.column_config.TextColumn("CCR", width="medium"),
+                "nodos":        st.column_config.NumberColumn("# Nodos", format="%d"),
+                "pml_promedio": st.column_config.NumberColumn("PML promedio", format="$%.2f"),
+                "pml_max":      st.column_config.NumberColumn("Nodo más caro", format="$%.2f"),
+                "pml_min":      st.column_config.NumberColumn("Nodo más barato", format="$%.2f"),
+            },
+        )
+    else:
+        # Modo solo mapa: solo conteo por CCR
+        ccr_stats = matches_ok.groupby('ccr').agg(
+            nodos=('clave', 'count'),
+        ).reset_index().sort_values('nodos', ascending=False)
+
+        st.markdown("##### 📊 Conteo por CCR")
+        st.dataframe(
+            ccr_stats, use_container_width=True, hide_index=True,
+            column_config={
+                "ccr":   st.column_config.TextColumn("CCR", width="medium"),
+                "nodos": st.column_config.NumberColumn("# Nodos", format="%d"),
+            },
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# RENDER BESS SCORING SECTION
+# ═══════════════════════════════════════════════════════════════════════
+def render_bess_scoring(df, use_case_default='Arbitraje'):
+    st.divider()
+    st.markdown("## 🔋 BESS Scoring")
+    st.caption("Ranking de nodos por idoneidad para distintos casos de uso de almacenamiento. "
+               "El score (0-100) usa rank-percentile de cada nodo dentro del set consultado.")
+
+    use_case = st.selectbox(
+        "Caso de uso",
+        list(PESOS_BESS.keys()),
+        index=list(PESOS_BESS.keys()).index(use_case_default),
+        key="bess_use_case",
+    )
+    st.markdown(f"<div class='mode-badge'>{DESCRIPCIONES_USE_CASE[use_case]}</div>",
+                unsafe_allow_html=True)
+
+    # Calcular métricas
+    df_metricas = calcular_metricas_bess(df)
+    if df_metricas.empty:
+        st.warning("No hay suficientes datos para calcular métricas BESS.")
+        return
+
+    # Pesos custom (en expander)
+    pesos_default = PESOS_BESS[use_case].copy()
+    pesos = pesos_default.copy()
+    with st.expander("⚙️ Ajustar pesos del scoring (opcional)"):
+        st.caption("Los pesos deben sumar aproximadamente 1.0. Cada métrica se "
+                   "rankea entre 0 y 1 dentro del set.")
+        col_p = st.columns(min(3, len(pesos_default)))
+        for i, (metrica, valor) in enumerate(pesos_default.items()):
+            with col_p[i % len(col_p)]:
+                pesos[metrica] = st.slider(
+                    metrica.replace('_', ' ').title(),
+                    min_value=0.0, max_value=1.0, value=valor, step=0.05,
+                    key=f"peso_{use_case}_{metrica}",
+                )
+        suma = sum(pesos.values())
+        if abs(suma - 1.0) > 0.05:
+            st.warning(f"⚠️ Pesos suman {suma:.2f} (debería ser ~1.0). "
+                        "Se normalizarán automáticamente.")
+            pesos = {k: v/suma for k, v in pesos.items()} if suma > 0 else pesos_default
+
+    # Calcular scoring
+    df_score = calcular_score_bess(df_metricas, use_case, pesos=pesos)
+
+    # Top 3 destacado
+    st.markdown("### 🏆 Top 3 nodos recomendados")
+    top3 = df_score.head(3)
+    cols_t = st.columns(3)
+    medals = ['🥇', '🥈', '🥉']
+    for i, (idx, row) in enumerate(top3.iterrows()):
+        with cols_t[i]:
+            st.metric(
+                f"{medals[i]} {row['nodo']}",
+                f"{row['score']:.1f}",
+                help=(f"PML promedio: ${row['pml_promedio']:.2f} | "
+                      f"Volatilidad: ${row['volatilidad']:.2f} | "
+                      f"Spread P95-P5: ${row['spread_p95_p5']:.2f}")
+            )
+
+    # Gráfica ranking
+    fig_rank = grafica_bess_ranking(df_score, use_case,
+                                      top_n=min(15, len(df_score)))
+    if fig_rank:
+        st.plotly_chart(fig_rank, use_container_width=True)
+
+    # Tabla completa
+    st.markdown("### 📋 Tabla completa con métricas")
     st.dataframe(
-        ccr_stats, use_container_width=True, hide_index=True,
+        df_score,
+        use_container_width=True,
+        hide_index=True,
         column_config={
-            "ccr":          st.column_config.TextColumn("CCR", width="medium"),
-            "nodos":        st.column_config.NumberColumn("# Nodos", format="%d"),
-            "pml_promedio": st.column_config.NumberColumn("PML promedio", format="$%.2f"),
-            "pml_max":      st.column_config.NumberColumn("Nodo más caro", format="$%.2f"),
-            "pml_min":      st.column_config.NumberColumn("Nodo más barato", format="$%.2f"),
+            "nodo":           st.column_config.TextColumn("Clave", width="small"),
+            "score":          st.column_config.NumberColumn("Score BESS", format="%.1f", help="0 (peor) a 100 (mejor)"),
+            "pml_promedio":   st.column_config.NumberColumn("PML promedio", format="$%.2f"),
+            "volatilidad":    st.column_config.NumberColumn("Volatilidad", format="$%.2f"),
+            "spread_p95_p5":  st.column_config.NumberColumn("Spread P95-P5", format="$%.2f"),
+            "spread_avg_diario": st.column_config.NumberColumn("Spread día prom", format="$%.2f"),
+            "spread_dia":     st.column_config.NumberColumn("Spread día/noche", format="$%.2f"),
+            "cambios_bruscos": st.column_config.NumberColumn("Cambios bruscos", format="%d"),
+            "horas_pico":     st.column_config.NumberColumn("Horas pico", format="%d"),
+            "pct_horas_neg":  st.column_config.NumberColumn("% horas neg", format="%.1f%%"),
         },
     )
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# RENDER DASHBOARD
+# RENDER DASHBOARD COMPLETO
 # ═══════════════════════════════════════════════════════════════════════
 def render_dashboard(acumulado, catalogo, matches_df=None, generar_kmz_flag=False):
     st.divider()
@@ -1211,10 +1555,8 @@ def render_dashboard(acumulado, catalogo, matches_df=None, generar_kmz_flag=Fals
             cm2.metric("🥇 Excelente / 🥈 Bueno", f"{n_exc} / {n_bue}")
             cm3.metric("🥉 Aceptable", n_ace)
 
-            fig_mapa = grafica_mapa(matches_df, df)
-            if fig_mapa:
-                st.plotly_chart(fig_mapa, use_container_width=True)
-
+            fig_mapa = grafica_mapa(matches_df, df, color_by='pml')
+            if fig_mapa: st.plotly_chart(fig_mapa, use_container_width=True)
             render_panel_ccr(matches_df, df)
 
             sin_match = matches_df[matches_df['lat'].isna()]
@@ -1258,19 +1600,16 @@ def render_dashboard(acumulado, catalogo, matches_df=None, generar_kmz_flag=Fals
             },
         )
 
-    # LÍNEAS
     st.markdown("### 📈 Evolución temporal del PML")
     fig_lin = grafica_lineas_tiempo(df, max_nodos=min(15, len(acumulado)))
     if fig_lin: st.plotly_chart(fig_lin, use_container_width=True)
 
-    # HEATMAP
     st.markdown("### 🔥 Heatmap horario × mensual")
     nodos_disp = sorted(df["nodo"].unique())
     nodo_h = st.selectbox("Selecciona nodo:", nodos_disp, index=0, key="sel_heatmap")
     fig_heat = grafica_heatmap_horario(df, nodo_h)
     if fig_heat: st.plotly_chart(fig_heat, use_container_width=True)
 
-    # RANKINGS
     st.markdown("### 🏆 Rankings comparativos")
     tab1, tab2, tab3 = st.tabs(["Mayor PML", "Mayor volatilidad", "Más horas negativas"])
     with tab1:
@@ -1283,6 +1622,9 @@ def render_dashboard(acumulado, catalogo, matches_df=None, generar_kmz_flag=Fals
         fig = grafica_barras_top(df, "negativos", top_n=min(10, len(acumulado)))
         if fig: st.plotly_chart(fig, use_container_width=True)
 
+    # BESS scoring al final
+    render_bess_scoring(df)
+
 
 # ═══════════════════════════════════════════════════════════════════════
 # UI PRINCIPAL
@@ -1292,7 +1634,7 @@ st.markdown(f"""
     <h1>⚡ CENACE PML Analyzer 
         <span class="srf-badge">SRF</span>
     </h1>
-    <p>Descarga, análisis y mapeo geográfico de PML — Recurrent Energy / Canadian Solar</p>
+    <p>Descarga, análisis, mapeo y BESS scoring — Recurrent Energy / Canadian Solar</p>
 </div>
 """, unsafe_allow_html=True)
 
@@ -1304,7 +1646,29 @@ else:
     st.warning("⚠️ Catálogo no cargado.")
 
 with st.sidebar:
-    st.markdown("### ⚙️ Parámetros de consulta")
+    st.markdown("### ⚙️ Configuración")
+
+    # MODO DE USO
+    st.markdown("**🚀 Modo de uso**")
+    modo = st.radio(
+        "Selecciona qué hacer:",
+        options=["🚀 Completo", "📊 Solo datos", "🗺️ Solo mapa"],
+        index=0,
+        help=(
+            "**Completo**: descarga datos + mapa + Excel + BESS scoring (1-5 min)\n\n"
+            "**Solo datos**: descarga datos PML, genera Excel y dashboard sin mapa (1-3 min)\n\n"
+            "**Solo mapa**: solo geocodifica (sin datos PML, sin Excel, ~5 segundos)"
+        ),
+        label_visibility="collapsed",
+    )
+
+    es_solo_mapa = (modo == "🗺️ Solo mapa")
+    es_solo_datos = (modo == "📊 Solo datos")
+    es_completo = (modo == "🚀 Completo")
+    necesita_datos = es_solo_datos or es_completo
+    necesita_mapa = es_solo_mapa or es_completo
+
+    st.markdown("---")
     st.markdown("**📍 Nodos CENACE**")
     nodos_input = st.text_area(
         "Lista de claves",
@@ -1312,30 +1676,39 @@ with st.sidebar:
         placeholder="01VAJ-230\n01XAL-230\n06FUN-115",
     )
 
-    col1, col2 = st.columns(2)
-    with col1:
-        sistema = st.selectbox("Sistema", ["SIN", "BCA", "BCS"], index=0)
-    with col2:
-        proceso = st.selectbox("Proceso", ["MTR", "MDA"], index=0)
+    # Sólo mostrar parámetros relevantes según modo
+    if necesita_datos:
+        col1, col2 = st.columns(2)
+        with col1:
+            sistema = st.selectbox("Sistema", ["SIN", "BCA", "BCS"], index=0)
+        with col2:
+            proceso = st.selectbox("Proceso", ["MTR", "MDA"], index=0)
 
-    st.markdown("**📅 Período**")
-    col_f1, col_f2 = st.columns(2)
-    today = date.today()
-    with col_f1:
-        f_ini = st.date_input("Desde", value=today - timedelta(days=90), max_value=today)
-    with col_f2:
-        f_fin = st.date_input("Hasta", value=today - timedelta(days=1), max_value=today)
+        st.markdown("**📅 Período**")
+        col_f1, col_f2 = st.columns(2)
+        today = date.today()
+        with col_f1:
+            f_ini = st.date_input("Desde", value=today - timedelta(days=90), max_value=today)
+        with col_f2:
+            f_fin = st.date_input("Hasta", value=today - timedelta(days=1), max_value=today)
+    else:
+        sistema = "SIN"; proceso = "MTR"
+        today = date.today()
+        f_ini = today - timedelta(days=90)
+        f_fin = today - timedelta(days=1)
 
-    st.markdown("**🗺️ Geocodificación**")
-    activar_geo = st.toggle("Activar mapa interactivo", value=True,
-                             help="Hace matching con OpenStreetMap")
-    generar_kmz_flag = False
-    if activar_geo:
-        generar_kmz_flag = st.toggle("Generar también KMZ descargable", value=False,
+    if necesita_mapa:
+        st.markdown("**🗺️ Geocodificación**")
+        generar_kmz_flag = st.toggle("Generar KMZ descargable", value=False,
                                        help="Para abrir en Google Earth Pro")
+    else:
+        generar_kmz_flag = False
 
-    st.markdown("**⚡ Performance**")
-    max_workers = st.slider("Workers paralelos", 3, 12, 8)
+    if necesita_datos:
+        st.markdown("**⚡ Performance**")
+        max_workers = st.slider("Workers paralelos", 3, 12, 8)
+    else:
+        max_workers = 8
 
     st.divider()
     st.caption("Sebastian Roldan (SRF)\nRecurrent Energy · Canadian Solar")
@@ -1344,6 +1717,20 @@ with st.sidebar:
 col_left, col_right = st.columns([2, 1])
 with col_left:
     st.markdown("### 🚀 Ejecutar consulta")
+
+    # Indicador del modo activo
+    modo_descripcion = {
+        "🚀 Completo": ("Descargará datos PML + mapeará nodos + generará Excel + "
+                        "calculará BESS scoring."),
+        "📊 Solo datos": "Descargará datos PML y generará Excel + dashboard analítico (sin mapa).",
+        "🗺️ Solo mapa": ("Solo localizará los nodos en OpenStreetMap. "
+                          "<b>No descargará datos PML ni generará Excel</b> — mucho más rápido."),
+    }
+    st.markdown(
+        f"<div class='mode-badge'><b>Modo: {modo}</b><br>{modo_descripcion[modo]}</div>",
+        unsafe_allow_html=True,
+    )
+
     nodos = []
     if nodos_input.strip():
         nodos_raw = re.split(r"[,\n]+", nodos_input.strip())
@@ -1362,54 +1749,81 @@ with col_left:
             with st.expander(f"⚠️ {len(ci)} nodos no encontrados"):
                 st.code("\n".join(ci))
 
-    if nodos and f_ini < f_fin:
+    if nodos and necesita_datos and f_ini < f_fin:
         n_dias = (f_fin - f_ini).days + 1
         n_bloques = (n_dias + BLOQUE_MAX - 1) // BLOQUE_MAX
         n_lotes = (len(nodos) + 9) // 10
         n_consultas = n_bloques * n_lotes
         tiempo = n_consultas * 1.5 / max_workers
         st.caption(f"📊 **{n_dias} días · {n_consultas} consultas · ~{tiempo/60:.1f} min**")
+    elif nodos and es_solo_mapa:
+        st.caption(f"🗺️ Solo geocodificación de **{len(nodos)} nodos** (~5 segundos)")
 
-    boton = st.button("⚡ Descargar datos", type="primary", disabled=(len(nodos) == 0))
+    boton = st.button("⚡ Ejecutar", type="primary", disabled=(len(nodos) == 0))
 
 with col_right:
     st.markdown("### 📋 Instrucciones")
-    st.markdown("""
-    1. Pega claves de nodos
-    2. Selecciona sistema, proceso, fechas
-    3. (Opcional) Activa mapa interactivo
-    4. Click en **Descargar datos**
-    5. Explora las visualizaciones
-    """)
+    if es_solo_mapa:
+        st.markdown("""
+        1. Pega claves de nodos
+        2. Click en **Ejecutar**
+        3. Ve la ubicación geográfica de tus nodos en el mapa
+        
+        ⚡ **Modo rápido**: no descarga datos PML.
+        """)
+    elif es_solo_datos:
+        st.markdown("""
+        1. Pega claves de nodos
+        2. Selecciona sistema, proceso, fechas
+        3. Click en **Ejecutar**
+        4. Descarga el Excel y explora el dashboard
+        """)
+    else:
+        st.markdown("""
+        1. Pega claves de nodos
+        2. Selecciona sistema, proceso, fechas
+        3. Click en **Ejecutar**
+        4. Mira mapa, dashboard y BESS scoring
+        5. Descarga Excel/KMZ si lo necesitas
+        """)
 
 
-if boton and nodos and f_ini < f_fin:
+if boton and nodos:
     fecha_ini = f_ini.strftime("%Y/%m/%d")
     fecha_fin = f_fin.strftime("%Y/%m/%d")
-    progress = st.progress(0, text="Iniciando...")
     t0 = time.time()
 
-    def cb(done, total):
-        progress.progress(done/total,
-                          text=f"Descargando: {done}/{total} ({done/total*100:.0f}%)")
-
     try:
-        with st.spinner("Consultando CENACE..."):
-            acumulado, errores = descargar_pml(
-                nodos, fecha_ini, fecha_fin, sistema, proceso,
-                max_workers=max_workers, progress_cb=cb,
-            )
-        elapsed = time.time() - t0
-        progress.progress(1.0, text=f"✅ Completo en {elapsed:.0f}s")
+        # Si necesita datos, descargar primero
+        acumulado = {}
+        errores = []
+        if necesita_datos:
+            if f_ini >= f_fin:
+                st.error("❌ La fecha inicial debe ser anterior a la final.")
+                st.stop()
 
-        if not acumulado:
-            st.error("❌ No se recibieron datos.")
-        else:
+            progress = st.progress(0, text="Iniciando descarga...")
+
+            def cb(done, total):
+                progress.progress(done/total,
+                                  text=f"Descargando: {done}/{total} ({done/total*100:.0f}%)")
+
+            with st.spinner("Consultando CENACE..."):
+                acumulado, errores = descargar_pml(
+                    nodos, fecha_ini, fecha_fin, sistema, proceso,
+                    max_workers=max_workers, progress_cb=cb,
+                )
+            progress.progress(1.0, text=f"✅ Datos descargados")
+
+            if not acumulado:
+                st.error("❌ No se recibieron datos PML.")
+                st.stop()
+
             n_total = sum(len(f) for f in acumulado.values())
             cx, cy, cz = st.columns(3)
             cx.metric("Nodos con datos", f"{len(acumulado)}/{len(nodos)}")
             cy.metric("Total registros", f"{n_total:,}")
-            cz.metric("Tiempo", f"{elapsed:.0f}s")
+            cz.metric("Tiempo descarga", f"{time.time()-t0:.0f}s")
 
             if errores:
                 with st.expander(f"⚠️ {len(errores)} errores"):
@@ -1428,22 +1842,62 @@ if boton and nodos and f_ini < f_fin:
                 type="primary",
             )
 
-            # Geo
-            matches_df = None
-            if activar_geo:
-                st.markdown("### 🗺️ Geocodificación de nodos")
-                with st.spinner("Cargando OSM (primera vez ~30s)..."):
-                    osm_subs = cargar_osm_subestaciones()
-                if osm_subs:
-                    st.caption(f"📍 {len(osm_subs):,} subestaciones OSM cargadas. Matcheando...")
-                    with st.spinner("Matcheando nodos con OSM..."):
-                        nodos_con_datos = list(acumulado.keys())
-                        resultados = matchear_nodos(nodos_con_datos, catalogo, osm_subs)
-                        matches_df = pd.DataFrame(resultados)
-                else:
-                    st.warning("⚠️ No se pudieron cargar las subestaciones OSM.")
+        # Si necesita mapa, hacer matching
+        matches_df = None
+        if necesita_mapa:
+            st.markdown("### 🗺️ Geocodificación de nodos")
+            with st.spinner("Cargando OSM (primera vez ~30s)..."):
+                osm_subs = cargar_osm_subestaciones()
+            if osm_subs:
+                st.caption(f"📍 {len(osm_subs):,} subestaciones OSM cargadas. Matcheando...")
+                with st.spinner("Matcheando nodos con OSM..."):
+                    nodos_a_matchear = list(acumulado.keys()) if necesita_datos else nodos
+                    resultados = matchear_nodos(nodos_a_matchear, catalogo, osm_subs)
+                    matches_df = pd.DataFrame(resultados)
+            else:
+                st.warning("⚠️ No se pudieron cargar las subestaciones OSM.")
 
+        # Render según modo
+        if es_solo_mapa:
+            # Sólo mapa
+            if matches_df is not None and not matches_df.empty:
+                n_mapeados = matches_df['lat'].notna().sum()
+                n_consultados = len(matches_df)
+                cm1, cm2, cm3 = st.columns(3)
+                cm1.metric("Mapeados", f"{n_mapeados}/{n_consultados}")
+                cc = matches_df['calidad'].value_counts()
+                cm2.metric("🥇 Excelente / 🥈 Bueno",
+                            f"{cc.get('🥇 Excelente', 0)} / {cc.get('🥈 Bueno', 0)}")
+                cm3.metric("🥉 Aceptable", cc.get('🥉 Aceptable', 0))
+
+                if n_mapeados > 0:
+                    fig_mapa = grafica_mapa(matches_df, color_by='ccr')
+                    if fig_mapa: st.plotly_chart(fig_mapa, use_container_width=True)
+                    render_panel_ccr(matches_df, None)
+
+                    sin_match = matches_df[matches_df['lat'].isna()]
+                    if not sin_match.empty:
+                        with st.expander(f"❌ {len(sin_match)} nodos sin match"):
+                            st.dataframe(
+                                sin_match[['clave', 'nombre_cenace', 'ccr', 'estado', 'razon']],
+                                use_container_width=True, hide_index=True,
+                            )
+
+                    if generar_kmz_flag:
+                        with st.spinner("Generando KMZ..."):
+                            kmz_bytes = generar_kmz(matches_df)
+                        ts = datetime.now().strftime("%Y%m%d_%H%M")
+                        st.download_button(
+                            label=f"🌍 Descargar KMZ ({n_mapeados} nodos)",
+                            data=kmz_bytes,
+                            file_name=f"PML_CENACE_Geo_{ts}.kmz",
+                            mime="application/vnd.google-earth.kmz",
+                        )
+        else:
+            # Modo completo o solo datos: dashboard completo
             render_dashboard(acumulado, catalogo, matches_df, generar_kmz_flag)
+
+        st.success(f"✅ Completado en {time.time()-t0:.0f}s")
 
     except Exception as e:
         st.error(f"❌ Error: {type(e).__name__}: {e}")
