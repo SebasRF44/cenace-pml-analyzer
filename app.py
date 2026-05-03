@@ -1,15 +1,20 @@
 """
-CENACE PML Analyzer — Streamlit Cloud Edition  v6
+CENACE PML Analyzer — Streamlit Cloud Edition  v7
 ======================================================
 Recurrent Energy / Canadian Solar — SRF · Sebastian Roldan
 
-v6 changes vs v5:
-- Selector de moneda MXN / USD con conversión vía Banxico FIX
-- Toggle global en sidebar afecta TODA la app (gráficas, tablas, Excel)
-- TC histórico día por día (serie SF43718 de Banxico)
-- Para días sin publicación (fines de semana, feriados): último día hábil
-- Token Banxico se lee desde st.secrets (NO del código)
-- Header muestra TC promedio del período cuando se está en USD
+v7 changes vs v6:
+- "Completo" → "🔬 Análisis"
+- Refresh automático al cambiar de modo (sin re-ejecutar)
+- Selector jerárquico de nodos (Sistema/Estado/Municipio/Zona/CCR/Voltaje)
+- Upload manual de catálogo CENACE actualizado
+- Gráfica PML promedio mensual multi-año (estilo screenshot SRF)
+- Gráficas nativas de Excel (openpyxl charts)
+- Warnings progresivos por # nodos (30 / 100 / 300 / 2500 si solo mapa)
+- Centro de Descargas con descripciones contextuales según tamaño
+- SRF discreto en portada Excel (sin watermark gigante)
+- Mapa: vista nacional inicial + selector "🔍 Acercar a nodo" para drill-down
+- Generación on-demand: Excel/KMZ solo se generan al click
 """
 
 import streamlit as st
@@ -173,12 +178,44 @@ OSM_HEADERS = {
 # CARGAR CATÁLOGO (cached)
 # ═══════════════════════════════════════════════════════════════════════
 @st.cache_data
-def cargar_catalogo():
+def cargar_catalogo_default():
+    """Carga el catálogo del repo (default)."""
     catalog_path = os.path.join(os.path.dirname(__file__), 'data', 'catalogo_nodos.xlsx')
     if not os.path.exists(catalog_path):
-        return {}
+        return {}, None
+    return _parse_catalogo_workbook(catalog_path), "repositorio (data/catalogo_nodos.xlsx)"
+
+
+def cargar_catalogo_uploaded(file_bytes):
+    """Carga catálogo desde bytes subidos por el usuario."""
     import openpyxl
-    wb = openpyxl.load_workbook(catalog_path, data_only=True, read_only=True)
+    try:
+        wb = openpyxl.load_workbook(io.BytesIO(file_bytes), data_only=True, read_only=True)
+        ws = wb[wb.sheetnames[0]]
+        catalogo = {}
+        for r in ws.iter_rows(min_row=3, values_only=True):
+            if not r or len(r) < 6 or not r[3]:
+                continue
+            clave = str(r[3]).strip()
+            catalogo[clave] = {
+                'sistema':   str(r[0]).strip() if r[0] else '',
+                'ccr':       str(r[1]).strip() if r[1] else '',
+                'zona':      str(r[2]).strip() if r[2] else '',
+                'nombre':    str(r[4]).strip() if r[4] else '',
+                'kv':        int(r[5]) if r[5] else 0,
+                'estado':    str(r[15]).strip() if len(r) > 15 and r[15] else '',
+                'municipio': str(r[17]).strip() if len(r) > 17 and r[17] else '',
+            }
+        wb.close()
+        return catalogo
+    except Exception as e:
+        return {}
+
+
+def _parse_catalogo_workbook(path):
+    """Parser interno que convierte un xlsx a dict."""
+    import openpyxl
+    wb = openpyxl.load_workbook(path, data_only=True, read_only=True)
     ws = wb[wb.sheetnames[0]]
     catalogo = {}
     for r in ws.iter_rows(min_row=3, values_only=True):
@@ -196,6 +233,14 @@ def cargar_catalogo():
         }
     wb.close()
     return catalogo
+
+
+def get_catalogo_activo():
+    """Retorna (catalogo, fuente) — catálogo subido por usuario o default del repo."""
+    if "catalogo_uploaded" in st.session_state and st.session_state["catalogo_uploaded"]:
+        return st.session_state["catalogo_uploaded"], "subido por usuario"
+    cat, fuente = cargar_catalogo_default()
+    return cat, fuente
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -860,25 +905,19 @@ def generar_excel_datos(acumulado, sistema, proceso, fecha_ini, fecha_fin,
         c2.border = BORDE
         ws.row_dimensions[ri].height = 22
 
-    ws.merge_cells("B17:H19")
-    c = ws["B17"]; c.value = "SRF"
-    c.font = Font(bold=True, color=C_HEADER, size=72, name="Arial")
-    c.alignment = Alignment(horizontal="center", vertical="center")
-    for r in range(17, 20):
-        ws.row_dimensions[r].height = 30
-
-    ws.merge_cells("B21:H21")
-    c = ws["B21"]; c.value = "Prepared by: Sebastian Roldan · Recurrent Energy"
+    # Footer discreto con SRF
+    ws.merge_cells("B17:H17")
+    c = ws["B17"]; c.value = "Prepared by: Sebastian Roldan (SRF) · Recurrent Energy"
     c.font = Font(italic=True, bold=True, color=C_HEADER, size=12, name="Arial")
     c.alignment = Alignment(horizontal="center", vertical="center")
     c.fill = PatternFill("solid", start_color=C_INFO)
-    ws.row_dimensions[21].height = 22
+    ws.row_dimensions[17].height = 24
 
-    ws.merge_cells("B22:H22")
-    c = ws["B22"]; c.value = "A subsidiary of Canadian Solar"
+    ws.merge_cells("B18:H18")
+    c = ws["B18"]; c.value = "A subsidiary of Canadian Solar"
     c.font = Font(italic=True, color="555555", size=10, name="Arial")
     c.alignment = Alignment(horizontal="center", vertical="center")
-    ws.row_dimensions[22].height = 18
+    ws.row_dimensions[18].height = 18
 
     for col, w in [("A", 3), ("B", 14), ("C", 14), ("D", 14),
                    ("E", 14), ("F", 14), ("G", 14), ("H", 14), ("I", 3)]:
@@ -967,8 +1006,13 @@ def generar_excel_datos(acumulado, sistema, proceso, fecha_ini, fecha_fin,
 # EXCEL ANÁLISIS (BESS Scoring + métricas)
 # ═══════════════════════════════════════════════════════════════════════
 def generar_excel_analisis(df_metricas, df_resumen, sistema, proceso, fecha_ini, fecha_fin,
-                             moneda="MXN", tc_info=None):
-    """Excel con BESS scoring para los 3 casos de uso + métricas."""
+                             moneda="MXN", tc_info=None, df_multianos=None,
+                             nodo_multianos=None):
+    """Excel con BESS scoring para los 3 casos de uso + métricas + (opcional) gráfica multi-año.
+
+    df_multianos: DataFrame con columnas mes_num + un col por año, con promedio PML.
+    nodo_multianos: nombre del nodo para el cual se calculó df_multianos.
+    """
     _NOW = datetime.now().strftime("%Y-%m-%d %H:%M")
     _side = Side(style="thin", color="BFBFBF")
     BORDE = Border(left=_side, right=_side, top=_side, bottom=_side)
@@ -1038,25 +1082,19 @@ def generar_excel_analisis(df_metricas, df_resumen, sistema, proceso, fecha_ini,
         c2.border = BORDE
         ws.row_dimensions[ri].height = 22
 
-    ws.merge_cells("B17:H19")
-    c = ws["B17"]; c.value = "SRF"
-    c.font = Font(bold=True, color=C_HEADER, size=72, name="Arial")
-    c.alignment = Alignment(horizontal="center", vertical="center")
-    for r in range(17, 20):
-        ws.row_dimensions[r].height = 30
-
-    ws.merge_cells("B21:H21")
-    c = ws["B21"]; c.value = "Prepared by: Sebastian Roldan · Recurrent Energy"
+    # Footer discreto con SRF
+    ws.merge_cells("B17:H17")
+    c = ws["B17"]; c.value = "Prepared by: Sebastian Roldan (SRF) · Recurrent Energy"
     c.font = Font(italic=True, bold=True, color=C_HEADER, size=12, name="Arial")
     c.alignment = Alignment(horizontal="center", vertical="center")
     c.fill = PatternFill("solid", start_color=C_INFO)
-    ws.row_dimensions[21].height = 22
+    ws.row_dimensions[17].height = 24
 
-    ws.merge_cells("B22:H22")
-    c = ws["B22"]; c.value = "A subsidiary of Canadian Solar"
+    ws.merge_cells("B18:H18")
+    c = ws["B18"]; c.value = "A subsidiary of Canadian Solar"
     c.font = Font(italic=True, color="555555", size=10, name="Arial")
     c.alignment = Alignment(horizontal="center", vertical="center")
-    ws.row_dimensions[22].height = 18
+    ws.row_dimensions[18].height = 18
 
     for col, w in [("A", 3), ("B", 16), ("C", 16), ("D", 16),
                    ("E", 16), ("F", 16), ("G", 16), ("H", 16), ("I", 3)]:
@@ -1228,6 +1266,69 @@ def generar_excel_analisis(df_metricas, df_resumen, sistema, proceso, fecha_ini,
     for ci, w in enumerate([14, 14, 14, 14, 14, 14, 14, 12, 12], 1):
         ws_m.column_dimensions[get_column_letter(ci)].width = w
     ws_m.freeze_panes = "A3"
+
+    # ─── HOJA OPCIONAL: gráfica multi-año (solo si se pasó df_multianos) ───
+    if df_multianos is not None and not df_multianos.empty and nodo_multianos:
+        from openpyxl.chart import LineChart, Reference
+        from openpyxl.chart.marker import Marker
+
+        ws_g = wb.create_sheet(f"📊 PML Mensual {nodo_multianos[:18]}"[:31])
+        ws_g.merge_cells("A1:N1")
+        c = ws_g["A1"]
+        c.value = f"PML promedio mensual por año · {nodo_multianos}"
+        c.font = Font(bold=True, color=C_WHITE, size=14, name="Arial")
+        c.fill = PatternFill("solid", start_color=C_HEADER)
+        c.alignment = Alignment(horizontal="center", vertical="center")
+        ws_g.row_dimensions[1].height = 26
+
+        # Tabla de datos: mes en col A, año en cols B..
+        meses_lbl = ['Ene', 'Feb', 'Mar', 'Abr', 'May', 'Jun',
+                     'Jul', 'Ago', 'Sep', 'Oct', 'Nov', 'Dic']
+        ws_g.cell(row=3, column=1, value="Mes")
+        hdr(ws_g.cell(row=3, column=1, value="Mes"), bg=C_SUB)
+
+        años_cols = sorted([c for c in df_multianos.columns if c != 'mes_num'])
+        for ci, año in enumerate(años_cols, start=2):
+            hdr(ws_g.cell(row=3, column=ci, value=str(año)), bg=C_SUB)
+
+        for ri, mes_idx in enumerate(range(1, 13), start=4):
+            ws_g.cell(row=ri, column=1, value=meses_lbl[mes_idx-1])
+            ws_g.cell(row=ri, column=1).font = _FONT_DATO
+            ws_g.cell(row=ri, column=1).border = BORDE
+            for ci, año in enumerate(años_cols, start=2):
+                v = df_multianos[df_multianos['mes_num'] == mes_idx][año].values
+                val = float(v[0]) if len(v) > 0 and pd.notna(v[0]) else None
+                cc = ws_g.cell(row=ri, column=ci, value=val)
+                cc.font = _FONT_DATO
+                cc.border = BORDE
+                cc.alignment = _ALIGN_NUM
+                cc.number_format = "#,##0.00"
+
+        # Crear gráfica de líneas nativa
+        chart = LineChart()
+        chart.title = f"PML promedio mensual ({_sym}/MWh) · {nodo_multianos}"
+        chart.style = 12
+        chart.height = 12
+        chart.width = 22
+        chart.y_axis.title = f"PML promedio ({_sym}/MWh)"
+        chart.x_axis.title = "Mes"
+
+        # Datos: cols B..H rows 3..15 (header row 3)
+        data_ref = Reference(ws_g, min_col=2, max_col=1+len(años_cols),
+                              min_row=3, max_row=15)
+        cats_ref = Reference(ws_g, min_col=1, min_row=4, max_row=15)
+        chart.add_data(data_ref, titles_from_data=True)
+        chart.set_categories(cats_ref)
+
+        # Estilo de marcadores
+        for s in chart.series:
+            s.smooth = False
+            s.marker = Marker(symbol="circle", size=8)
+
+        ws_g.add_chart(chart, "A18")
+
+        for ci, w in enumerate([10] + [12] * len(años_cols), 1):
+            ws_g.column_dimensions[get_column_letter(ci)].width = w
 
     buffer = io.BytesIO()
     wb.save(buffer); buffer.seek(0)
@@ -1490,6 +1591,84 @@ def grafica_heatmap_horario(df, nodo_seleccionado):
                       tickfont=dict(family="Arial", size=11, color=TEXT_DARK),
                       title=dict(text="Mes", font=dict(family="Arial", size=13, color=TEXT_DARK)))
     return fig
+
+
+def grafica_pml_multiano(df, nodo_seleccionado):
+    """Gráfica de PML promedio mensual por año (estilo SRF screenshot).
+
+    Para el nodo seleccionado, calcula el PML promedio de cada mes en cada año
+    presente en los datos. Genera puntos conectados con colores corporativos.
+    """
+    if df.empty: return None, []
+    sub = df[df["nodo"] == nodo_seleccionado].copy()
+    if sub.empty: return None, []
+
+    sub["año"] = sub["fecha_dt"].dt.year
+    sub["mes_num"] = sub["fecha_dt"].dt.month
+
+    años_disponibles = sorted(sub["año"].unique())
+    if len(años_disponibles) < 1:
+        return None, []
+
+    # Promedio mensual por año
+    pivot = sub.pivot_table(values="pml", index="mes_num", columns="año",
+                              aggfunc="mean").round(1)
+
+    # Reindexar para tener todos los 12 meses
+    pivot = pivot.reindex(range(1, 13))
+
+    meses_labels = ['ene', 'feb', 'mar', 'abr', 'may', 'jun',
+                    'jul', 'ago', 'sep', 'oct', 'nov', 'dic']
+
+    # Colores corporativos por año (rotando paleta)
+    color_anos = {
+        años_disponibles[0]: RE_RED,
+    }
+    if len(años_disponibles) >= 2:
+        color_anos[años_disponibles[1]] = "#5ba0d4"  # azul claro RE
+    if len(años_disponibles) >= 3:
+        color_anos[años_disponibles[2]] = RE_NAVY
+    if len(años_disponibles) >= 4:
+        color_anos[años_disponibles[3]] = "#d4a017"
+    # Más años: rotar paleta
+    for i, year in enumerate(años_disponibles[4:]):
+        color_anos[year] = PALETTE[(i + 4) % len(PALETTE)]
+
+    fig = go.Figure()
+    promedios_anuales = {}
+
+    for año in años_disponibles:
+        if año not in pivot.columns:
+            continue
+        valores = pivot[año]
+        promedio_anual = valores.mean()
+        promedios_anuales[año] = promedio_anual
+
+        sym = label_moneda_short()
+        nombre_traza = f"PML Avg {año}: {sym}{promedio_anual:.0f}/MWh"
+
+        fig.add_trace(go.Scatter(
+            x=meses_labels,
+            y=valores.values,
+            mode='lines+markers',
+            name=nombre_traza,
+            line=dict(color=color_anos[año], width=2, dash='dot'),
+            marker=dict(color=color_anos[año], size=10,
+                        line=dict(color='white', width=1.5)),
+            hovertemplate=f"<b>{año}</b><br>%{{x}}: {sym}%{{y:.1f}}<extra></extra>",
+        ))
+
+    fig.update_layout(**_layout_estandar(
+        f"📊 PML promedio mensual · {nodo_seleccionado}", height=480))
+    fig.update_layout(
+        legend=dict(
+            orientation="v", yanchor="top", y=0.98, xanchor="right", x=0.98,
+            bgcolor="rgba(255,255,255,0.95)",
+            bordercolor=AXIS_LINE, borderwidth=1.5,
+            font=dict(family="Arial", size=11, color=TEXT_DARK),
+        ),
+    )
+    return _ejes_estandar(fig, "Mes", f"PML promedio {label_moneda()}"), años_disponibles
 
 
 def grafica_barras_top(df, metrica="promedio", top_n=10):
@@ -2058,6 +2237,28 @@ def render_dashboard(acumulado, catalogo, matches_df=None):
     fig_heat = grafica_heatmap_horario(df, nodo_h)
     if fig_heat: st.plotly_chart(fig_heat, use_container_width=True)
 
+    # ─── PML PROMEDIO MULTI-AÑO ───
+    años_total = df['fecha_dt'].dt.year.nunique() if 'fecha_dt' in df.columns else 1
+    st.markdown("### 📊 PML promedio mensual por año")
+    if años_total < 1:
+        st.caption("Sin datos suficientes para gráfica multi-año.")
+    else:
+        nodo_multi = st.selectbox(
+            "Selecciona nodo para ver evolución mensual por año:",
+            nodos_disp,
+            index=nodos_disp.index(nodo_h) if nodo_h in nodos_disp else 0,
+            key="sel_multiano",
+            help="Muestra promedio mensual del PML del nodo, comparando años disponibles."
+        )
+        fig_multi, años_disp = grafica_pml_multiano(df, nodo_multi)
+        if fig_multi:
+            st.plotly_chart(fig_multi, use_container_width=True)
+            if len(años_disp) == 1:
+                st.caption(f"ℹ️ Solo hay datos del año {años_disp[0]}. "
+                           f"Para comparar años, consulta un período que cubra más de un año natural.")
+        else:
+            st.warning("No se pudo generar la gráfica multi-año.")
+
     st.markdown("### 🏆 Rankings comparativos")
     tab1, tab2, tab3 = st.tabs(["Mayor PML", "Mayor volatilidad", "Más horas negativas"])
     with tab1:
@@ -2084,60 +2285,130 @@ def render_centro_descargas(acumulado, catalogo, sistema, proceso, fecha_ini, fe
     moneda_label = f"💱 Análisis en **{moneda}**"
     if moneda == "USD" and tc_info and tc_info.get("tc_promedio"):
         moneda_label += f" · TC FIX promedio: **{tc_info['tc_promedio']:.4f} MXN/USD**"
-    st.caption(f"Selecciona los archivos que necesites descargar. {moneda_label}")
+    st.caption(f"Selecciona los archivos que necesites. {moneda_label}")
+    st.caption("⚡ Los archivos solo se generan cuando das click en cada botón.")
 
     df = acumulado_a_dataframe(acumulado, catalogo)
     df_resumen = calcular_resumen(df) if not df.empty else pd.DataFrame()
     df_metricas = calcular_metricas_bess(df) if not df.empty else pd.DataFrame()
     ts = datetime.now().strftime("%Y%m%d_%H%M")
     sufijo = f"_{moneda}"
+    n_nodos = len(acumulado)
+
+    # ─── Selector multi-año (solo si <= 20 nodos) ───
+    nodo_multianos = None
+    df_multianos = None
+    incluir_multianos = False
+
+    if n_nodos > 0 and n_nodos <= 20:
+        st.markdown("##### 📊 Gráfica multi-año en Excel de Análisis")
+        st.caption(
+            f"Como tu consulta tiene **{n_nodos} nodos** (≤20), puedes incluir una gráfica de "
+            f"PML promedio mensual por año en el Excel de Análisis. Selecciona el nodo:"
+        )
+        col_a, col_b = st.columns([2, 1])
+        with col_a:
+            nodos_disp = sorted(df["nodo"].unique()) if not df.empty else []
+            if nodos_disp:
+                nodo_multianos = st.selectbox(
+                    "Nodo para gráfica multi-año:",
+                    nodos_disp,
+                    key="sel_multianos_excel",
+                )
+        with col_b:
+            incluir_multianos = st.toggle(
+                "Incluir en Excel",
+                value=True,
+                key="tog_incluir_multianos",
+                help="Agrega una hoja con gráfica nativa de Excel"
+            )
+
+        if incluir_multianos and nodo_multianos and not df.empty:
+            sub = df[df["nodo"] == nodo_multianos].copy()
+            if not sub.empty:
+                sub["año"] = sub["fecha_dt"].dt.year
+                sub["mes_num"] = sub["fecha_dt"].dt.month
+                pivot = sub.pivot_table(values="pml", index="mes_num",
+                                          columns="año", aggfunc="mean").round(2)
+                df_multianos = pivot.reset_index()
+
+    elif n_nodos > 20:
+        st.info(
+            f"⚠️ Tu consulta tiene **{n_nodos} nodos**. "
+            f"La gráfica multi-año solo se incluye automáticamente si hay ≤20 nodos. "
+            f"Si quieres la gráfica para un nodo específico, reduce tu consulta."
+        )
+
+    st.markdown("##### 📦 Tipos de archivos disponibles")
+
+    # ─── Descripciones contextuales según tamaño ───
+    if n_nodos < 20:
+        desc_datos = f"📊 Excel **ligero** (~{n_nodos*150} KB · ~5s) — portada + resumen + 1 hoja por nodo"
+        desc_anal  = f"📈 Excel **compacto** (~80 KB · ~3s) — BESS Scoring 3 use cases + métricas"
+        if incluir_multianos:
+            desc_anal += " + gráfica multi-año"
+    elif n_nodos <= 50:
+        desc_datos = f"📊 Excel **medio** (~{n_nodos*200} KB · ~30s) — 1 hoja por nodo"
+        desc_anal  = f"📈 Excel **compacto** (~100 KB · ~5s) — BESS Scoring 3 use cases + métricas"
+    elif n_nodos <= 100:
+        desc_datos = f"📊 Excel **pesado** (~{n_nodos*250} KB · 1-2 min) — 1 hoja por nodo · puede tardar al abrir"
+        desc_anal  = f"📈 Excel **compacto** (~120 KB · ~10s) — BESS Scoring 3 use cases + métricas"
+    else:
+        desc_datos = f"📊 Excel **muy pesado** (~{n_nodos*300} KB · 2-5 min) — ⚠️ usa modo Solo Datos con cuidado"
+        desc_anal  = f"📈 Excel **compacto** (~150 KB · ~20s) — BESS Scoring 3 use cases + métricas"
 
     col1, col2, col3 = st.columns(3)
 
     with col1:
         st.markdown("##### 📊 Excel de Datos")
-        st.caption(f"Datos PML completos en {moneda}: portada + resumen + 1 hoja por nodo.")
+        st.caption(desc_datos)
         if "excel_datos_bytes" not in st.session_state:
             st.session_state["excel_datos_bytes"] = None
-        if st.button("Generar Excel datos", key="btn_gen_datos", type="primary"):
-            with st.spinner("Generando Excel de datos..."):
+        if st.button("Generar y descargar", key="btn_gen_datos", type="primary",
+                      use_container_width=True):
+            with st.spinner(f"Generando Excel de datos ({n_nodos} nodos)..."):
                 st.session_state["excel_datos_bytes"] = generar_excel_datos(
                     acumulado, sistema, proceso, fecha_ini, fecha_fin,
                     moneda=moneda, tc_info=tc_info)
         if st.session_state["excel_datos_bytes"]:
             st.download_button(
-                label="📥 Descargar",
+                label="📥 Descargar archivo",
                 data=st.session_state["excel_datos_bytes"],
                 file_name=f"PML_CENACE_Datos{sufijo}_{sistema}_{ts}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 key="dl_datos",
+                use_container_width=True,
             )
 
     with col2:
         st.markdown("##### 📈 Excel de Análisis")
-        st.caption(f"BESS Scoring 3 casos de uso + métricas en {moneda}.")
+        st.caption(desc_anal)
         if "excel_analisis_bytes" not in st.session_state:
             st.session_state["excel_analisis_bytes"] = None
-        if st.button("Generar Excel análisis", key="btn_gen_anal", type="primary"):
+        if st.button("Generar y descargar", key="btn_gen_anal", type="primary",
+                      use_container_width=True):
             if df_metricas.empty:
                 st.error("No hay suficientes datos para generar análisis.")
             else:
                 with st.spinner("Generando Excel de análisis..."):
                     st.session_state["excel_analisis_bytes"] = generar_excel_analisis(
                         df_metricas, df_resumen, sistema, proceso, fecha_ini, fecha_fin,
-                        moneda=moneda, tc_info=tc_info)
+                        moneda=moneda, tc_info=tc_info,
+                        df_multianos=df_multianos if incluir_multianos else None,
+                        nodo_multianos=nodo_multianos if incluir_multianos else None)
         if st.session_state["excel_analisis_bytes"]:
             st.download_button(
-                label="📥 Descargar",
+                label="📥 Descargar archivo",
                 data=st.session_state["excel_analisis_bytes"],
                 file_name=f"PML_CENACE_Analisis_BESS{sufijo}_{sistema}_{ts}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 key="dl_anal",
+                use_container_width=True,
             )
 
     with col3:
         st.markdown("##### 🌍 KMZ Geográfico")
-        st.caption("Ubicación de los nodos en Google Earth Pro.")
+        st.caption("🌍 Archivo Google Earth (~10-200 KB) — nodos mapeados con calidad del match")
         if matches_df is None or matches_df.empty:
             st.info("⚠️ La geocodificación no se hizo. Activa el toggle '🗺️ Incluir geocodificación' en el sidebar y vuelve a ejecutar.")
         else:
@@ -2147,16 +2418,19 @@ def render_centro_descargas(acumulado, catalogo, sistema, proceso, fecha_ini, fe
             else:
                 if "kmz_bytes" not in st.session_state:
                     st.session_state["kmz_bytes"] = None
-                if st.button(f"Generar KMZ ({n_mapeados} nodos)", key="btn_gen_kmz", type="primary"):
+                if st.button(f"Generar y descargar ({n_mapeados} nodos)",
+                              key="btn_gen_kmz", type="primary",
+                              use_container_width=True):
                     with st.spinner("Generando KMZ..."):
                         st.session_state["kmz_bytes"] = generar_kmz(matches_df)
                 if st.session_state["kmz_bytes"]:
                     st.download_button(
-                        label="📥 Descargar",
+                        label="📥 Descargar archivo",
                         data=st.session_state["kmz_bytes"],
                         file_name=f"PML_CENACE_Geo_{ts}.kmz",
                         mime="application/vnd.google-earth.kmz",
                         key="dl_kmz",
+                        use_container_width=True,
                     )
 
 
@@ -2172,10 +2446,11 @@ st.markdown(f"""
 </div>
 """, unsafe_allow_html=True)
 
-catalogo = cargar_catalogo()
+catalogo, catalogo_fuente = get_catalogo_activo()
 if catalogo:
+    badge_fuente = "📦 default" if catalogo_fuente == "repositorio (data/catalogo_nodos.xlsx)" else "📤 actualizado"
     st.info(f"📚 Catálogo CENACE cargado: **{len(catalogo):,} nodos** disponibles · "
-            f"versión 2026-04-23")
+            f"{badge_fuente}")
 else:
     st.warning("⚠️ Catálogo no cargado.")
 
@@ -2195,10 +2470,10 @@ with st.sidebar:
     st.markdown("**🚀 Modo de uso**")
     modo = st.radio(
         "Selecciona qué hacer:",
-        options=["🚀 Completo", "📊 Solo datos", "🗺️ Solo mapa"],
+        options=["🔬 Análisis", "📊 Solo datos", "🗺️ Solo mapa"],
         index=0,
         help=(
-            "**Completo**: descarga + dashboard + mapa + BESS scoring (sin Excel)\n\n"
+            "**Análisis**: descarga + dashboard + mapa + BESS scoring (sin Excel)\n\n"
             "**Solo datos**: descarga + Centro de descargas (Excel/KMZ)\n\n"
             "**Solo mapa**: solo geocodifica (~5 segundos)"
         ),
@@ -2207,7 +2482,7 @@ with st.sidebar:
 
     es_solo_mapa = (modo == "🗺️ Solo mapa")
     es_solo_datos = (modo == "📊 Solo datos")
-    es_completo = (modo == "🚀 Completo")
+    es_completo = (modo == "🔬 Análisis")
     necesita_datos = es_solo_datos or es_completo
     necesita_mapa = es_solo_mapa or es_completo
 
@@ -2234,10 +2509,86 @@ with st.sidebar:
     st.markdown("**📍 Nodos CENACE**")
     nodos_input = st.text_area(
         "Lista de claves",
-        height=150,
+        height=120,
         placeholder="01VAJ-230\n01XAL-230\n06FUN-115",
         key="nodos_input",
     )
+
+    # ─── SELECTOR JERÁRQUICO ───
+    with st.expander("🔍 Buscar nodos por filtros (Estado / Zona / CCR / kV)"):
+        if catalogo:
+            cat_df = pd.DataFrame.from_dict(catalogo, orient='index').reset_index()
+            cat_df.rename(columns={'index': 'clave'}, inplace=True)
+
+            sistemas_disp = sorted(cat_df['sistema'].dropna().unique())
+            sistemas_disp = [s for s in sistemas_disp if s]
+            sis_sel = st.selectbox("🌎 Sistema", ["Todos"] + sistemas_disp, key="filt_sis")
+            df_f = cat_df.copy() if sis_sel == "Todos" else cat_df[cat_df['sistema'] == sis_sel]
+
+            estados_disp = sorted([e for e in df_f['estado'].dropna().unique() if e])
+            est_sel = st.multiselect("🏛️ Estado(s)", estados_disp, key="filt_est")
+            if est_sel:
+                df_f = df_f[df_f['estado'].isin(est_sel)]
+
+            municipios_disp = sorted([m for m in df_f['municipio'].dropna().unique() if m])
+            mun_sel = st.multiselect("🏘️ Municipio(s)", municipios_disp, key="filt_mun")
+            if mun_sel:
+                df_f = df_f[df_f['municipio'].isin(mun_sel)]
+
+            zonas_disp = sorted([z for z in df_f['zona'].dropna().unique() if z])
+            zona_sel = st.multiselect("🗺️ Zona CENACE", zonas_disp, key="filt_zona")
+            if zona_sel:
+                df_f = df_f[df_f['zona'].isin(zona_sel)]
+
+            ccr_disp = sorted([c for c in df_f['ccr'].dropna().unique() if c])
+            ccr_sel = st.multiselect("📍 CCR (Centro Control Regional)", ccr_disp, key="filt_ccr")
+            if ccr_sel:
+                df_f = df_f[df_f['ccr'].isin(ccr_sel)]
+
+            kvs_disp = sorted([int(k) for k in df_f['kv'].dropna().unique() if k > 0])
+            kv_sel = st.multiselect("⚡ Voltaje (kV)", kvs_disp, key="filt_kv")
+            if kv_sel:
+                df_f = df_f[df_f['kv'].isin(kv_sel)]
+
+            st.markdown(f"**📋 {len(df_f):,} nodos coinciden**")
+
+            if len(df_f) > 0:
+                # Buscador opcional
+                buscar = st.text_input("🔎 Buscar por nombre/clave (opcional)", key="filt_buscar")
+                if buscar:
+                    mask = (df_f['clave'].str.contains(buscar, case=False, na=False) |
+                            df_f['nombre'].str.contains(buscar, case=False, na=False))
+                    df_f = df_f[mask]
+                    st.caption(f"Tras filtro: **{len(df_f):,} nodos**")
+
+                # Mostrar tabla compacta
+                if len(df_f) > 0:
+                    st.dataframe(
+                        df_f[['clave', 'nombre', 'ccr', 'estado', 'kv']].head(100),
+                        use_container_width=True, hide_index=True,
+                        column_config={
+                            "clave":  st.column_config.TextColumn("Clave", width="small"),
+                            "nombre": st.column_config.TextColumn("Nombre", width="medium"),
+                            "ccr":    st.column_config.TextColumn("CCR", width="small"),
+                            "estado": st.column_config.TextColumn("Estado", width="small"),
+                            "kv":     st.column_config.NumberColumn("kV", format="%d"),
+                        },
+                        height=200,
+                    )
+                    if len(df_f) > 100:
+                        st.caption(f"⚠️ Mostrando solo los primeros 100 (refina filtros para ver todos)")
+
+                    # Botón para agregar al textarea
+                    if st.button(f"✅ Agregar {len(df_f)} nodos al textarea", key="btn_add_nodos"):
+                        nuevas_claves = "\n".join(df_f['clave'].tolist())
+                        actuales = nodos_input.strip()
+                        if actuales:
+                            st.session_state["nodos_input"] = actuales + "\n" + nuevas_claves
+                        else:
+                            st.session_state["nodos_input"] = nuevas_claves
+                        st.rerun()
+        else:
+            st.warning("No hay catálogo cargado para filtrar.")
 
     if necesita_datos:
         col1, col2 = st.columns(2)
@@ -2270,6 +2621,31 @@ with st.sidebar:
         incluir_geo_solo_datos = False
 
     st.divider()
+    with st.expander("📤 Actualizar catálogo de nodos"):
+        st.caption(
+            "El catálogo se actualiza ~1 vez al mes. Si tienes una versión más nueva, "
+            "súbelo aquí (.xlsx) y reemplazará el catálogo durante esta sesión."
+        )
+        uploaded_cat = st.file_uploader(
+            "Catálogo CENACE (.xlsx)",
+            type=["xlsx"],
+            key="cat_upload",
+            help="Archivo `Catálogo_NodosP_Sistema_Eléctrico_Nacional` del portal CENACE",
+        )
+        if uploaded_cat is not None:
+            file_bytes = uploaded_cat.read()
+            new_cat = cargar_catalogo_uploaded(file_bytes)
+            if new_cat:
+                st.session_state["catalogo_uploaded"] = new_cat
+                st.success(f"✅ Catálogo actualizado: **{len(new_cat):,} nodos**")
+                st.rerun()
+            else:
+                st.error("❌ No se pudo leer el archivo. Verifica que sea el catálogo CENACE oficial.")
+        if "catalogo_uploaded" in st.session_state and st.session_state["catalogo_uploaded"]:
+            if st.button("🔄 Volver al catálogo default", key="btn_reset_cat"):
+                st.session_state["catalogo_uploaded"] = None
+                st.rerun()
+
     st.caption("Sebastian Roldan (SRF)\nRecurrent Energy · Canadian Solar")
 
 
@@ -2278,7 +2654,7 @@ with col_left:
     st.markdown("### 🚀 Ejecutar consulta")
 
     modo_descripcion = {
-        "🚀 Completo": "Descargará datos PML + mapeará nodos + dashboard + BESS scoring (sin Excel).",
+        "🔬 Análisis": "Descargará datos PML + mapeará nodos + dashboard + BESS scoring (sin Excel).",
         "📊 Solo datos": "Descargará datos PML y mostrará un Centro de Descargas con Excel/KMZ.",
         "🗺️ Solo mapa": ("Solo localizará los nodos en OpenStreetMap. <b>Sin descargar PML.</b>"),
     }
@@ -2315,7 +2691,55 @@ with col_left:
     elif nodos and es_solo_mapa:
         st.caption(f"🗺️ Solo geocodificación de **{len(nodos)} nodos** (~5 segundos)")
 
-    boton = st.button("⚡ Ejecutar", type="primary", disabled=(len(nodos) == 0))
+    # ─── WARNINGS PROGRESIVOS POR # NODOS ───
+    n_nodos = len(nodos)
+    confirmacion_grande = True
+    bloqueo_duro = False
+
+    if n_nodos > 0:
+        if es_solo_mapa:
+            # Solo mapa permite hasta 2500 (es ligero)
+            if n_nodos > 2500:
+                st.error(
+                    f"🔴 **{n_nodos} nodos** es demasiado para procesar incluso en modo Solo Mapa. "
+                    f"Por estabilidad, sugiero dividir en consultas menores a 2500 nodos."
+                )
+                bloqueo_duro = True
+            elif n_nodos > 500:
+                st.warning(
+                    f"⚠️ **{n_nodos} nodos** es una consulta grande. "
+                    f"Solo Mapa puede tomar 30-60s. Si quieres datos PML, divide en partes."
+                )
+        else:
+            # Modo Análisis o Solo Datos: límites más estrictos
+            if n_nodos > 300:
+                st.error(
+                    f"🔴 **{n_nodos} nodos** excede el límite recomendado para Análisis/Solo Datos. "
+                    f"La app web puede colgarse por OOM (limite 1GB RAM en Streamlit Cloud Free). "
+                    f"Sugiero dividir en consultas de 100-200 nodos. "
+                    f"💡 Si solo quieres ver dónde están en el mapa, usa modo **🗺️ Solo Mapa** "
+                    f"(soporta hasta 2500 nodos)."
+                )
+                bloqueo_duro = True
+            elif n_nodos >= 100:
+                st.warning(
+                    f"🟠 **{n_nodos} nodos** es una consulta grande. "
+                    f"Puede tomar 5-10 minutos y consumir mucha memoria."
+                )
+                confirmacion_grande = st.checkbox(
+                    f"He revisado y quiero proceder con {n_nodos} nodos",
+                    key="conf_grande"
+                )
+            elif n_nodos >= 30:
+                st.info(
+                    f"⚠️ **{n_nodos} nodos** — esto puede tomar 2-5 minutos."
+                )
+
+    boton = st.button(
+        "⚡ Ejecutar",
+        type="primary",
+        disabled=(len(nodos) == 0 or bloqueo_duro or not confirmacion_grande)
+    )
 
 with col_right:
     st.markdown("### 📋 Instrucciones")
@@ -2480,20 +2904,71 @@ if st.session_state.get("consulta_ejecutada"):
     matches_df = st.session_state["matches_df"]
     params = st.session_state["consulta_params"]
     fx_info = st.session_state.get("fx_info", {"moneda": "MXN"})
-    modo_cur = params.get("modo", modo)
+    # Modo actual del sidebar (no el guardado) — esto permite re-render instantáneo
+    # al cambiar de modo sin re-ejecutar la descarga
+    modo_cur = modo
+    modo_consulta_original = params.get("modo", modo)
 
-    # Asegurar que la moneda mostrada coincida con la de la consulta ya hecha
-    moneda_aplicada = params.get("moneda_aplicada", "MXN")
-    st.session_state["moneda"] = moneda_aplicada
+    # Detectar si parámetros que requieren re-descarga cambiaron
+    moneda_actual = st.session_state.get("moneda", "MXN")
+    moneda_consulta = params.get("moneda_aplicada", "MXN")
+
+    # Si cambio el modo entre consulta y ahora pero los datos sirven
+    cambio_solo_modo = (modo_cur != modo_consulta_original)
+
+    # Cambios que SI requieren re-ejecutar
+    parametros_cambiaron = []
+    if necesita_datos:
+        if moneda_actual != moneda_consulta:
+            parametros_cambiaron.append(f"moneda ({moneda_consulta} → {moneda_actual})")
+        # Comparar fechas y sistema/proceso
+        f_ini_str = f_ini.strftime("%Y/%m/%d")
+        f_fin_str = f_fin.strftime("%Y/%m/%d")
+        if f_ini_str != params.get("fecha_ini") or f_fin_str != params.get("fecha_fin"):
+            parametros_cambiaron.append("fechas")
+        if sistema != params.get("sistema") or proceso != params.get("proceso"):
+            parametros_cambiaron.append(f"{sistema}/{proceso}")
+
+    # Validar si los datos actuales sirven para el modo actual
+    modo_requiere_datos = ("📊" in modo_cur or "🔬" in modo_cur)
+    modo_requiere_mapa = ("🗺️" in modo_cur or "🔬" in modo_cur)
+    datos_disponibles = bool(acumulado)
+    mapa_disponible = matches_df is not None and not matches_df.empty
+
+    # Warning si cambiaron parámetros
+    if parametros_cambiaron:
+        st.warning(
+            f"⚠️ **Algunos parámetros cambiaron:** {', '.join(parametros_cambiaron)}. "
+            f"Los datos mostrados corresponden a la consulta anterior. "
+            f"Da click en **⚡ Ejecutar** arriba para refrescar."
+        )
+
+    # Warning si modo cambió y faltan datos para ese modo
+    if cambio_solo_modo:
+        if modo_requiere_datos and not datos_disponibles:
+            st.warning(
+                f"⚠️ El modo **{modo_cur}** necesita datos PML descargados. "
+                f"Da click en **⚡ Ejecutar** para descargarlos."
+            )
+            st.stop()
+        if modo_requiere_mapa and not mapa_disponible:
+            st.info(
+                f"ℹ️ El modo **{modo_cur}** necesita geocodificación. "
+                f"Da click en **⚡ Ejecutar** para hacer el matching geográfico."
+            )
+
+    # Mostrar moneda usada por la consulta vigente
+    st.session_state["moneda"] = moneda_consulta  # forzar render con moneda de consulta
 
     # Banner FX si está en USD
-    if moneda_aplicada == "USD" and fx_info.get("tc_promedio"):
+    if moneda_consulta == "USD" and fx_info.get("tc_promedio"):
         st.info(
             f"💱 **Análisis en USD** · "
             f"TC promedio del período: **{fx_info['tc_promedio']:.4f} MXN/USD** · "
             f"Fuente: {fx_info['fuente']}"
         )
 
+    # Solo mostrar métricas de descarga si el modo lo requiere
     if necesita_datos and acumulado:
         n_total = sum(len(f) for f in acumulado.values())
         cx, cy, cz = st.columns(3)
@@ -2540,12 +3015,12 @@ if st.session_state.get("consulta_ejecutada"):
                 params["sistema"], params["proceso"],
                 params["fecha_ini"], params["fecha_fin"],
                 matches_df=matches_df,
-                moneda=moneda_aplicada,
+                moneda=moneda_consulta,
                 tc_info=fx_info,
             )
 
     else:
-        # Modo completo: dashboard sin Excel
+        # Modo Análisis: dashboard inline + BESS scoring (sin Excel — usar Solo Datos para descargar)
         if acumulado:
             render_dashboard(acumulado, catalogo, matches_df)
 
