@@ -1,20 +1,21 @@
 """
-CENACE PML Analyzer — Streamlit Cloud Edition  v7
+CENACE PML Analyzer — Streamlit Cloud Edition  v9
 ======================================================
 Recurrent Energy / Canadian Solar — SRF · Sebastian Roldan
 
-v7 changes vs v6:
-- "Completo" → "🔬 Análisis"
-- Refresh automático al cambiar de modo (sin re-ejecutar)
-- Selector jerárquico de nodos (Sistema/Estado/Municipio/Zona/CCR/Voltaje)
-- Upload manual de catálogo CENACE actualizado
-- Gráfica PML promedio mensual multi-año (estilo screenshot SRF)
-- Gráficas nativas de Excel (openpyxl charts)
-- Warnings progresivos por # nodos (30 / 100 / 300 / 2500 si solo mapa)
-- Centro de Descargas con descripciones contextuales según tamaño
-- SRF discreto en portada Excel (sin watermark gigante)
-- Mapa: vista nacional inicial + selector "🔍 Acercar a nodo" para drill-down
-- Generación on-demand: Excel/KMZ solo se generan al click
+v9 changes vs v8:
+- Auto-detect Sistema (SIN/BCA/BCS) desde catálogo, queda solo MDA/MTR en sidebar
+- Default fechas: hoy −2 semanas → hoy −1 día (delay CENACE)
+- Warning si fecha fin > hoy −7 días (delay típico)
+- "Moneda del análisis" → "FX Selector"
+- Título "⚡🔋 Node Analyzer" más grande
+- Multi-año en Excel: 1 hoja por nodo si ≤20 nodos (Opción C)
+- Spread por CCR: gráfica continua con líneas por zona (≥2 CCRs)
+- Excel Custom con toggle de gráficos seleccionables
+- Click en filtro limpia consulta anterior
+- Botón "Limpiar todo" para reset completo
+- Badge "X nodos del filtro"
+- Bug leyenda USD/MWh arreglado
 """
 
 import streamlit as st
@@ -829,6 +830,70 @@ def descargar_pml(nodos, fecha_ini, fecha_fin, sistema, proceso, progress_cb=Non
     return acumulado, errores_consulta
 
 
+def descargar_pml_auto(nodos, fecha_ini, fecha_fin, proceso, catalogo, progress_cb=None):
+    """Auto-detecta el Sistema de cada nodo desde el catálogo y descarga.
+
+    Si hay nodos de varios sistemas (raro: BCA/BCS son redes aisladas), hace
+    consultas paralelas y combina resultados.
+
+    Retorna (acumulado, errores, info_sistemas) donde info_sistemas es un dict
+    {sistema: count_nodos}.
+    """
+    # Agrupar nodos por sistema según catálogo
+    grupos = {"SIN": [], "BCA": [], "BCS": []}
+    nodos_sin_sistema = []
+
+    for nodo in nodos:
+        info = catalogo.get(nodo, {}) if catalogo else {}
+        sistema = (info.get("sistema") or "").strip().upper()
+        if sistema in grupos:
+            grupos[sistema].append(nodo)
+        else:
+            # Fallback: asumir SIN (95% de los nodos están ahí)
+            nodos_sin_sistema.append(nodo)
+            grupos["SIN"].append(nodo)
+
+    info_sistemas = {s: len(ns) for s, ns in grupos.items() if ns}
+
+    # Si todo es un solo sistema, llamada directa (sin overhead)
+    sistemas_activos = [s for s, ns in grupos.items() if ns]
+    if len(sistemas_activos) == 1:
+        sistema = sistemas_activos[0]
+        acumulado, errores = descargar_pml(
+            grupos[sistema], fecha_ini, fecha_fin, sistema, proceso, progress_cb=progress_cb)
+        return acumulado, errores, info_sistemas, nodos_sin_sistema
+
+    # Multi-sistema: descargar cada uno en serie (no paralelo entre sistemas
+    # para no saturar el progress bar; cada sistema YA usa workers paralelos internos)
+    acumulado_total = {}
+    errores_total = []
+
+    # Progress bar combinado
+    completed_jobs = [0]
+    total_jobs_estimate = sum(
+        len(generar_bloques(fecha_ini, fecha_fin)) * ((len(grupos[s]) + 9) // 10)
+        for s in sistemas_activos
+    )
+
+    def cb_combined(done, total_per_system):
+        if progress_cb and total_jobs_estimate > 0:
+            current = completed_jobs[0] + done
+            progress_cb(current, total_jobs_estimate)
+
+    for sistema in sistemas_activos:
+        nodos_grupo = grupos[sistema]
+        if not nodos_grupo:
+            continue
+        n_jobs_grupo = len(generar_bloques(fecha_ini, fecha_fin)) * ((len(nodos_grupo) + 9) // 10)
+        ac_g, err_g = descargar_pml(nodos_grupo, fecha_ini, fecha_fin, sistema, proceso,
+                                      progress_cb=cb_combined)
+        acumulado_total.update(ac_g)
+        errores_total.extend(err_g)
+        completed_jobs[0] += n_jobs_grupo
+
+    return acumulado_total, errores_total, info_sistemas, nodos_sin_sistema
+
+
 # ═══════════════════════════════════════════════════════════════════════
 # EXCEL DATOS (datos crudos)
 # ═══════════════════════════════════════════════════════════════════════
@@ -1268,68 +1333,419 @@ def generar_excel_analisis(df_metricas, df_resumen, sistema, proceso, fecha_ini,
         ws_m.column_dimensions[get_column_letter(ci)].width = w
     ws_m.freeze_panes = "A3"
 
-    # ─── HOJA OPCIONAL: gráfica multi-año (solo si se pasó df_multianos) ───
-    if df_multianos is not None and not df_multianos.empty and nodo_multianos:
+    # ─── HOJAS OPCIONALES: gráficas multi-año (1 por nodo) ───
+    # df_multianos puede ser:
+    #   (a) Un DataFrame único (compatibilidad v8: 1 nodo en nodo_multianos)
+    #   (b) Un dict {nodo: df_multianos} para múltiples nodos
+    multi_dict = None
+    if isinstance(df_multianos, dict) and df_multianos:
+        multi_dict = df_multianos
+    elif df_multianos is not None and not df_multianos.empty and nodo_multianos:
+        multi_dict = {nodo_multianos: df_multianos}
+
+    if multi_dict:
         from openpyxl.chart import LineChart, Reference
         from openpyxl.chart.marker import Marker
 
-        ws_g = wb.create_sheet(f"📊 PML Mensual {nodo_multianos[:18]}"[:31])
-        ws_g.merge_cells("A1:N1")
-        c = ws_g["A1"]
-        c.value = f"PML promedio mensual por año · {nodo_multianos}"
+        meses_lbl = ['Ene', 'Feb', 'Mar', 'Abr', 'May', 'Jun',
+                     'Jul', 'Ago', 'Sep', 'Oct', 'Nov', 'Dic']
+
+        for nodo_n, df_n in multi_dict.items():
+            if df_n is None or df_n.empty:
+                continue
+
+            sheet_name = f"📊 {nodo_n[:24]}"[:31]  # Excel limit 31 chars
+            ws_g = wb.create_sheet(sheet_name)
+
+            ws_g.merge_cells("A1:N1")
+            c = ws_g["A1"]
+            c.value = f"PML promedio mensual por año · {nodo_n}"
+            c.font = Font(bold=True, color=C_WHITE, size=14, name="Arial")
+            c.fill = PatternFill("solid", start_color=C_HEADER)
+            c.alignment = Alignment(horizontal="center", vertical="center")
+            ws_g.row_dimensions[1].height = 26
+
+            ws_g.cell(row=3, column=1, value="Mes")
+            hdr(ws_g.cell(row=3, column=1, value="Mes"), bg=C_SUB)
+
+            años_cols = sorted([c for c in df_n.columns if c != 'mes_num'])
+            for ci, año in enumerate(años_cols, start=2):
+                hdr(ws_g.cell(row=3, column=ci, value=str(año)), bg=C_SUB)
+
+            for ri, mes_idx in enumerate(range(1, 13), start=4):
+                ws_g.cell(row=ri, column=1, value=meses_lbl[mes_idx-1])
+                ws_g.cell(row=ri, column=1).font = _FONT_DATO
+                ws_g.cell(row=ri, column=1).border = BORDE
+                for ci, año in enumerate(años_cols, start=2):
+                    v = df_n[df_n['mes_num'] == mes_idx][año].values
+                    val = float(v[0]) if len(v) > 0 and pd.notna(v[0]) else None
+                    cc = ws_g.cell(row=ri, column=ci, value=val)
+                    cc.font = _FONT_DATO
+                    cc.border = BORDE
+                    cc.alignment = _ALIGN_NUM
+                    cc.number_format = "#,##0.00"
+
+            chart = LineChart()
+            chart.title = f"PML promedio mensual ({_sym}/MWh) · {nodo_n}"
+            chart.style = 12
+            chart.height = 12
+            chart.width = 22
+            chart.y_axis.title = f"PML promedio ({_sym}/MWh)"
+            chart.x_axis.title = "Mes"
+
+            data_ref = Reference(ws_g, min_col=2, max_col=1+len(años_cols),
+                                  min_row=3, max_row=15)
+            cats_ref = Reference(ws_g, min_col=1, min_row=4, max_row=15)
+            chart.add_data(data_ref, titles_from_data=True)
+            chart.set_categories(cats_ref)
+
+            for s in chart.series:
+                s.smooth = False
+                s.marker = Marker(symbol="circle", size=8)
+
+            ws_g.add_chart(chart, "A18")
+
+            for ci, w in enumerate([10] + [12] * len(años_cols), 1):
+                ws_g.column_dimensions[get_column_letter(ci)].width = w
+
+    buffer = io.BytesIO()
+    wb.save(buffer); buffer.seek(0)
+    return buffer.getvalue()
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# EXCEL CUSTOM — usuario selecciona qué gráficos incluir
+# ═══════════════════════════════════════════════════════════════════════
+def generar_excel_custom(df, df_resumen, df_metricas, opciones, sistema, proceso,
+                          fecha_ini, fecha_fin, moneda="MXN", tc_info=None,
+                          df_multianos_dict=None):
+    """Excel personalizado con secciones que el usuario selecciona.
+
+    opciones: dict con keys booleanas:
+        'resumen', 'multiano', 'spread_ccr', 'bess_arbitraje',
+        'bess_ssaa', 'bess_firming', 'top_pml', 'top_volatilidad'
+    """
+    from openpyxl.chart import LineChart, BarChart, Reference
+    from openpyxl.chart.marker import Marker
+
+    _NOW = datetime.now().strftime("%Y-%m-%d %H:%M")
+    _side = Side(style="thin", color="BFBFBF")
+    BORDE = Border(left=_side, right=_side, top=_side, bottom=_side)
+    _sym = "USD$" if moneda == "USD" else "$"
+
+    def hdr(cell, bg=C_HEADER, fg=C_WHITE, size=11):
+        cell.font = Font(bold=True, color=fg, size=size, name="Arial")
+        cell.fill = PatternFill("solid", start_color=bg)
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        cell.border = BORDE
+
+    _FONT_DATO = Font(name="Arial", size=10)
+    _ALIGN_NUM = Alignment(horizontal="center", vertical="center")
+    _ALIGN_TXT = Alignment(horizontal="left", vertical="center")
+    _FILL_ALT  = PatternFill("solid", start_color=C_ALT)
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "■ Portada"
+    ws.sheet_properties.tabColor = C_HEADER
+    ws.sheet_view.showGridLines = False
+
+    # Portada
+    ws.merge_cells("B2:H4")
+    c = ws["B2"]
+    c.value = f"Excel Custom — Análisis PML\nGenerado a la medida"
+    c.font = Font(bold=True, color=C_WHITE, size=22, name="Arial")
+    c.fill = PatternFill("solid", start_color=C_HEADER)
+    c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    for r in range(2, 5):
+        ws.row_dimensions[r].height = 32
+
+    secciones_inc = [k for k, v in opciones.items() if v]
+    info_rows = [
+        ("Sistema", sistema), ("Proceso", proceso),
+        ("Período", f"{fecha_ini} → {fecha_fin}"),
+        ("Nodos", f"{df['nodo'].nunique() if not df.empty else 0}"),
+        ("Moneda", f"{moneda}" + (f" · TC FIX promedio: {tc_info['tc_promedio']:.4f}"
+                                     if tc_info and tc_info.get('tc_promedio') else "")),
+        ("Secciones incluidas", ", ".join(secciones_inc) if secciones_inc else "—"),
+        ("Fecha generación", _NOW),
+    ]
+    for ri, (lbl, val) in enumerate(info_rows, start=7):
+        ws.merge_cells(f"B{ri}:D{ri}")
+        c1 = ws[f"B{ri}"]; c1.value = lbl
+        c1.font = Font(bold=True, color=C_HEADER, size=11, name="Arial")
+        c1.fill = PatternFill("solid", start_color=C_INFO)
+        c1.alignment = Alignment(horizontal="left", vertical="center", indent=1)
+        c1.border = BORDE
+        ws.merge_cells(f"E{ri}:H{ri}")
+        c2 = ws[f"E{ri}"]; c2.value = val
+        c2.font = Font(size=11, name="Arial")
+        c2.alignment = Alignment(horizontal="left", vertical="center", indent=1)
+        c2.border = BORDE
+        ws.row_dimensions[ri].height = 22
+
+    ws.merge_cells("B17:H17")
+    c = ws["B17"]; c.value = "Prepared by: Sebastian Roldan (SRF) · Recurrent Energy"
+    c.font = Font(italic=True, bold=True, color=C_HEADER, size=12, name="Arial")
+    c.alignment = Alignment(horizontal="center", vertical="center")
+    c.fill = PatternFill("solid", start_color=C_INFO)
+    ws.row_dimensions[17].height = 24
+
+    for col, w in [("A", 3), ("B", 18), ("C", 18), ("D", 18),
+                   ("E", 18), ("F", 18), ("G", 18), ("H", 18), ("I", 3)]:
+        ws.column_dimensions[col].width = w
+
+    # ─── SECCIÓN: Resumen ───
+    if opciones.get("resumen") and df_resumen is not None and not df_resumen.empty:
+        ws_r = wb.create_sheet("📊 Resumen")
+        ws_r.merge_cells("A1:K1")
+        c = ws_r["A1"]; c.value = f"Resumen estadístico ({moneda})"
         c.font = Font(bold=True, color=C_WHITE, size=14, name="Arial")
         c.fill = PatternFill("solid", start_color=C_HEADER)
         c.alignment = Alignment(horizontal="center", vertical="center")
-        ws_g.row_dimensions[1].height = 26
+        ws_r.row_dimensions[1].height = 26
 
-        # Tabla de datos: mes en col A, año en cols B..
-        meses_lbl = ['Ene', 'Feb', 'Mar', 'Abr', 'May', 'Jun',
-                     'Jul', 'Ago', 'Sep', 'Oct', 'Nov', 'Dic']
-        ws_g.cell(row=3, column=1, value="Mes")
-        hdr(ws_g.cell(row=3, column=1, value="Mes"), bg=C_SUB)
+        cols = ["Nodo", "Nombre", "CCR", "# Reg", "Promedio", "Mediana",
+                "Máximo", "Mínimo", "Volatilidad", "P95", "% horas neg"]
+        for ci, col in enumerate(cols, 1):
+            hdr(ws_r.cell(row=2, column=ci, value=col), bg=C_SUB)
+        ws_r.row_dimensions[2].height = 22
 
-        años_cols = sorted([c for c in df_multianos.columns if c != 'mes_num'])
-        for ci, año in enumerate(años_cols, start=2):
-            hdr(ws_g.cell(row=3, column=ci, value=str(año)), bg=C_SUB)
-
-        for ri, mes_idx in enumerate(range(1, 13), start=4):
-            ws_g.cell(row=ri, column=1, value=meses_lbl[mes_idx-1])
-            ws_g.cell(row=ri, column=1).font = _FONT_DATO
-            ws_g.cell(row=ri, column=1).border = BORDE
-            for ci, año in enumerate(años_cols, start=2):
-                v = df_multianos[df_multianos['mes_num'] == mes_idx][año].values
-                val = float(v[0]) if len(v) > 0 and pd.notna(v[0]) else None
-                cc = ws_g.cell(row=ri, column=ci, value=val)
+        for i, (_, r) in enumerate(df_resumen.iterrows(), 1):
+            bg = C_ALT if i % 2 == 0 else None
+            valores = [r['nodo'], r['nombre'], r['ccr'], r['registros'],
+                       r['promedio'], r['mediana'], r['maximo'], r['minimo'],
+                       r['std'], r['p95'], r['% horas neg']]
+            for ci, v in enumerate(valores, 1):
+                cc = ws_r.cell(row=i+2, column=ci, value=v)
                 cc.font = _FONT_DATO
                 cc.border = BORDE
-                cc.alignment = _ALIGN_NUM
-                cc.number_format = "#,##0.00"
+                cc.alignment = _ALIGN_NUM if ci > 3 else _ALIGN_TXT
+                if bg: cc.fill = PatternFill("solid", start_color=bg)
+                if ci in (5, 6, 7, 8, 9, 10): cc.number_format = "#,##0.00"
+                elif ci == 11: cc.number_format = "0.0\"%\""
 
-        # Crear gráfica de líneas nativa
-        chart = LineChart()
-        chart.title = f"PML promedio mensual ({_sym}/MWh) · {nodo_multianos}"
-        chart.style = 12
-        chart.height = 12
-        chart.width = 22
-        chart.y_axis.title = f"PML promedio ({_sym}/MWh)"
-        chart.x_axis.title = "Mes"
+        for ci, w in enumerate([14, 22, 14, 10, 12, 12, 12, 12, 12, 12, 12], 1):
+            ws_r.column_dimensions[get_column_letter(ci)].width = w
+        ws_r.freeze_panes = "A3"
 
-        # Datos: cols B..H rows 3..15 (header row 3)
-        data_ref = Reference(ws_g, min_col=2, max_col=1+len(años_cols),
-                              min_row=3, max_row=15)
-        cats_ref = Reference(ws_g, min_col=1, min_row=4, max_row=15)
-        chart.add_data(data_ref, titles_from_data=True)
-        chart.set_categories(cats_ref)
+    # ─── SECCIÓN: BESS Scoring (3 use cases si seleccionados) ───
+    bess_use_cases = []
+    if opciones.get("bess_arbitraje"): bess_use_cases.append('Arbitraje')
+    if opciones.get("bess_ssaa"): bess_use_cases.append('Servicios Auxiliares')
+    if opciones.get("bess_firming"): bess_use_cases.append('Renewables Firming')
 
-        # Estilo de marcadores
-        for s in chart.series:
-            s.smooth = False
-            s.marker = Marker(symbol="circle", size=8)
+    for use_case in bess_use_cases:
+        df_score = calcular_score_bess(df_metricas, use_case)
+        if df_score.empty:
+            continue
+        sheet_name = f"BESS {use_case[:22]}"[:31]
+        ws_b = wb.create_sheet(sheet_name)
+        ws_b.merge_cells("A1:J1")
+        c = ws_b["A1"]; c.value = f"BESS Scoring — {use_case}"
+        c.font = Font(bold=True, color=C_WHITE, size=13, name="Arial")
+        c.fill = PatternFill("solid", start_color=C_HEADER)
+        c.alignment = Alignment(horizontal="center", vertical="center")
+        ws_b.row_dimensions[1].height = 26
 
-        ws_g.add_chart(chart, "A18")
+        cols = ["Rank", "Nodo", "Score (0-100)", "PML promedio",
+                "Volatilidad", "Spread P95-P5", "Spread día prom",
+                "Cambios bruscos", "Horas pico", "% horas neg"]
+        for ci, col in enumerate(cols, 1):
+            hdr(ws_b.cell(row=2, column=ci, value=col), bg=C_SUB)
+        ws_b.row_dimensions[2].height = 32
 
-        for ci, w in enumerate([10] + [12] * len(años_cols), 1):
-            ws_g.column_dimensions[get_column_letter(ci)].width = w
+        for i, (_, r) in enumerate(df_score.iterrows(), 1):
+            bg = C_ALT if i % 2 == 0 else None
+            valores = [i, r['nodo'], r['score'], r['pml_promedio'],
+                       r['volatilidad'], r['spread_p95_p5'],
+                       r['spread_avg_diario'], r['cambios_bruscos'],
+                       r['horas_pico'], r['pct_horas_neg']]
+            for ci, v in enumerate(valores, 1):
+                cc = ws_b.cell(row=i+2, column=ci, value=v)
+                cc.font = _FONT_DATO
+                cc.border = BORDE
+                cc.alignment = _ALIGN_NUM if ci != 2 else _ALIGN_TXT
+                if bg: cc.fill = PatternFill("solid", start_color=bg)
+                if ci in (3, 4, 5, 6, 7): cc.number_format = "#,##0.00"
+                elif ci == 10: cc.number_format = "0.0\"%\""
+
+        for ci, w in enumerate([8, 16, 14, 14, 14, 14, 14, 14, 12, 14], 1):
+            ws_b.column_dimensions[get_column_letter(ci)].width = w
+        ws_b.freeze_panes = "A3"
+
+    # ─── SECCIÓN: Multi-año (1 hoja por nodo) ───
+    if opciones.get("multiano") and df_multianos_dict:
+        meses_lbl = ['Ene', 'Feb', 'Mar', 'Abr', 'May', 'Jun',
+                     'Jul', 'Ago', 'Sep', 'Oct', 'Nov', 'Dic']
+        for nodo_n, df_n in df_multianos_dict.items():
+            if df_n is None or df_n.empty:
+                continue
+            sheet_name = f"📊 {nodo_n[:24]}"[:31]
+            ws_g = wb.create_sheet(sheet_name)
+            ws_g.merge_cells("A1:N1")
+            c = ws_g["A1"]
+            c.value = f"PML promedio mensual por año · {nodo_n}"
+            c.font = Font(bold=True, color=C_WHITE, size=14, name="Arial")
+            c.fill = PatternFill("solid", start_color=C_HEADER)
+            c.alignment = Alignment(horizontal="center", vertical="center")
+            ws_g.row_dimensions[1].height = 26
+
+            hdr(ws_g.cell(row=3, column=1, value="Mes"), bg=C_SUB)
+            años_cols = sorted([c for c in df_n.columns if c != 'mes_num'])
+            for ci, año in enumerate(años_cols, start=2):
+                hdr(ws_g.cell(row=3, column=ci, value=str(año)), bg=C_SUB)
+
+            for ri, mes_idx in enumerate(range(1, 13), start=4):
+                ws_g.cell(row=ri, column=1, value=meses_lbl[mes_idx-1])
+                ws_g.cell(row=ri, column=1).font = _FONT_DATO
+                ws_g.cell(row=ri, column=1).border = BORDE
+                for ci, año in enumerate(años_cols, start=2):
+                    v = df_n[df_n['mes_num'] == mes_idx][año].values
+                    val = float(v[0]) if len(v) > 0 and pd.notna(v[0]) else None
+                    cc = ws_g.cell(row=ri, column=ci, value=val)
+                    cc.font = _FONT_DATO
+                    cc.border = BORDE
+                    cc.alignment = _ALIGN_NUM
+                    cc.number_format = "#,##0.00"
+
+            chart = LineChart()
+            chart.title = f"PML promedio mensual ({_sym}/MWh) · {nodo_n}"
+            chart.style = 12
+            chart.height = 12
+            chart.width = 22
+            chart.y_axis.title = f"PML promedio ({_sym}/MWh)"
+            chart.x_axis.title = "Mes"
+            data_ref = Reference(ws_g, min_col=2, max_col=1+len(años_cols),
+                                  min_row=3, max_row=15)
+            cats_ref = Reference(ws_g, min_col=1, min_row=4, max_row=15)
+            chart.add_data(data_ref, titles_from_data=True)
+            chart.set_categories(cats_ref)
+            for s in chart.series:
+                s.smooth = False
+                s.marker = Marker(symbol="circle", size=8)
+            ws_g.add_chart(chart, "A18")
+
+            for ci, w in enumerate([10] + [12] * len(años_cols), 1):
+                ws_g.column_dimensions[get_column_letter(ci)].width = w
+
+    # ─── SECCIÓN: Spread por CCR ───
+    if opciones.get("spread_ccr") and not df.empty:
+        ccrs_unicos = sorted([c for c in df['ccr'].unique() if c and c != "?"])
+        if len(ccrs_unicos) >= 2:
+            ws_c = wb.create_sheet("📊 Spread CCR")
+            ws_c.merge_cells("A1:N1")
+            c = ws_c["A1"]
+            c.value = f"Spread mensual por CCR · {len(ccrs_unicos)} zonas"
+            c.font = Font(bold=True, color=C_WHITE, size=14, name="Arial")
+            c.fill = PatternFill("solid", start_color=C_HEADER)
+            c.alignment = Alignment(horizontal="center", vertical="center")
+            ws_c.row_dimensions[1].height = 26
+
+            df_w = df[['ccr', 'fecha_dt', 'pml']].copy()
+            df_w['periodo'] = df_w['fecha_dt'].dt.to_period('M').dt.to_timestamp()
+            monthly = df_w.groupby(['ccr', 'periodo'])['pml'].mean().reset_index()
+            pivot = monthly.pivot(index='periodo', columns='ccr', values='pml').round(2)
+
+            hdr(ws_c.cell(row=3, column=1, value="Periodo"), bg=C_SUB)
+            ccr_cols = list(pivot.columns)
+            for ci, ccr in enumerate(ccr_cols, start=2):
+                hdr(ws_c.cell(row=3, column=ci, value=str(ccr)), bg=C_SUB)
+
+            for ri, (per, row_vals) in enumerate(pivot.iterrows(), start=4):
+                ws_c.cell(row=ri, column=1, value=per.strftime("%b %Y"))
+                ws_c.cell(row=ri, column=1).font = _FONT_DATO
+                ws_c.cell(row=ri, column=1).border = BORDE
+                for ci, ccr in enumerate(ccr_cols, start=2):
+                    val = row_vals[ccr]
+                    val_clean = float(val) if pd.notna(val) else None
+                    cc = ws_c.cell(row=ri, column=ci, value=val_clean)
+                    cc.font = _FONT_DATO
+                    cc.border = BORDE
+                    cc.alignment = _ALIGN_NUM
+                    cc.number_format = "#,##0.00"
+
+            chart_ccr = LineChart()
+            chart_ccr.title = f"Spread mensual por CCR ({_sym}/MWh)"
+            chart_ccr.style = 12
+            chart_ccr.height = 14
+            chart_ccr.width = 26
+            chart_ccr.y_axis.title = f"PML promedio ({_sym}/MWh)"
+            chart_ccr.x_axis.title = "Periodo"
+            n_rows = len(pivot)
+            data_ref = Reference(ws_c, min_col=2, max_col=1+len(ccr_cols),
+                                  min_row=3, max_row=3+n_rows)
+            cats_ref = Reference(ws_c, min_col=1, min_row=4, max_row=3+n_rows)
+            chart_ccr.add_data(data_ref, titles_from_data=True)
+            chart_ccr.set_categories(cats_ref)
+            for s in chart_ccr.series:
+                s.smooth = False
+            ws_c.add_chart(chart_ccr, f"A{4+n_rows+2}")
+
+            for ci, w in enumerate([14] + [14] * len(ccr_cols), 1):
+                ws_c.column_dimensions[get_column_letter(ci)].width = w
+
+    # ─── SECCIÓN: Top PML / Volatilidad ───
+    if opciones.get("top_pml") or opciones.get("top_volatilidad"):
+        ws_t = wb.create_sheet("🏆 Rankings")
+        ws_t.merge_cells("A1:F1")
+        c = ws_t["A1"]
+        c.value = "Rankings comparativos"
+        c.font = Font(bold=True, color=C_WHITE, size=14, name="Arial")
+        c.fill = PatternFill("solid", start_color=C_HEADER)
+        c.alignment = Alignment(horizontal="center", vertical="center")
+        ws_t.row_dimensions[1].height = 26
+
+        cur_row = 3
+        if opciones.get("top_pml") and not df.empty:
+            ws_t.merge_cells(f"A{cur_row}:F{cur_row}")
+            c = ws_t.cell(row=cur_row, column=1, value="🏆 Top PML promedio")
+            c.font = Font(bold=True, color=C_WHITE, size=12, name="Arial")
+            c.fill = PatternFill("solid", start_color=C_RED)
+            c.alignment = Alignment(horizontal="center", vertical="center")
+            ws_t.row_dimensions[cur_row].height = 22
+            cur_row += 1
+
+            top_pml = df.groupby("nodo")["pml"].mean().sort_values(ascending=False).head(10).round(2)
+            for ci, h in enumerate(["Rank", "Nodo", f"PML promedio ({_sym}/MWh)"], 1):
+                hdr(ws_t.cell(row=cur_row, column=ci, value=h), bg=C_SUB)
+            cur_row += 1
+            for i, (nodo_n, val) in enumerate(top_pml.items(), 1):
+                ws_t.cell(row=cur_row, column=1, value=i).font = _FONT_DATO
+                ws_t.cell(row=cur_row, column=2, value=str(nodo_n)).font = _FONT_DATO
+                ws_t.cell(row=cur_row, column=3, value=val).font = _FONT_DATO
+                for ci in range(1, 4):
+                    ws_t.cell(row=cur_row, column=ci).border = BORDE
+                    ws_t.cell(row=cur_row, column=ci).alignment = _ALIGN_NUM
+                ws_t.cell(row=cur_row, column=3).number_format = "#,##0.00"
+                cur_row += 1
+            cur_row += 1
+
+        if opciones.get("top_volatilidad") and not df.empty:
+            ws_t.merge_cells(f"A{cur_row}:F{cur_row}")
+            c = ws_t.cell(row=cur_row, column=1, value="📊 Top volatilidad")
+            c.font = Font(bold=True, color=C_WHITE, size=12, name="Arial")
+            c.fill = PatternFill("solid", start_color=C_RED)
+            c.alignment = Alignment(horizontal="center", vertical="center")
+            ws_t.row_dimensions[cur_row].height = 22
+            cur_row += 1
+
+            top_vol = df.groupby("nodo")["pml"].std().sort_values(ascending=False).head(10).round(2)
+            for ci, h in enumerate(["Rank", "Nodo", f"Volatilidad ({_sym}/MWh)"], 1):
+                hdr(ws_t.cell(row=cur_row, column=ci, value=h), bg=C_SUB)
+            cur_row += 1
+            for i, (nodo_n, val) in enumerate(top_vol.items(), 1):
+                ws_t.cell(row=cur_row, column=1, value=i).font = _FONT_DATO
+                ws_t.cell(row=cur_row, column=2, value=str(nodo_n)).font = _FONT_DATO
+                ws_t.cell(row=cur_row, column=3, value=val).font = _FONT_DATO
+                for ci in range(1, 4):
+                    ws_t.cell(row=cur_row, column=ci).border = BORDE
+                    ws_t.cell(row=cur_row, column=ci).alignment = _ALIGN_NUM
+                ws_t.cell(row=cur_row, column=3).number_format = "#,##0.00"
+                cur_row += 1
+
+        for ci, w in enumerate([8, 18, 22, 14, 14, 14], 1):
+            ws_t.column_dimensions[get_column_letter(ci)].width = w
 
     buffer = io.BytesIO()
     wb.save(buffer); buffer.seek(0)
@@ -1680,19 +2096,6 @@ def grafica_pml_multiano(df, nodo_seleccionado):
     fig.update_layout(**_layout_estandar(
         f"📊 PML promedio mensual · {nodo_seleccionado}", height=520))
 
-    # Leyenda con dot de color por año (data label visual)
-    # Plotly genera la leyenda automáticamente con el color de la traza,
-    # así que agregamos anotación adicional con bullets coloreados arriba a la izquierda
-    annot_html = ""
-    for año in años_disponibles:
-        if año in color_anos and año in promedios_anuales:
-            color = color_anos[año]
-            sym = label_moneda_short()
-            annot_html += (
-                f"<span style='color:{color};font-size:18px'>●</span> "
-                f"<b>{año}: {sym}{promedios_anuales[año]:.0f}/MWh</b>   "
-            )
-
     fig.update_layout(
         legend=dict(
             orientation="v", yanchor="top", y=0.98, xanchor="right", x=0.98,
@@ -1701,23 +2104,66 @@ def grafica_pml_multiano(df, nodo_seleccionado):
             font=dict(family="Arial", size=12, color=TEXT_DARK),
             itemsizing='constant',  # mantiene el dot del color visible
         ),
-        annotations=[
-            dict(
-                xref='paper', yref='paper',
-                x=0.02, y=1.08,
-                xanchor='left', yanchor='top',
-                showarrow=False,
-                text=annot_html,
-                font=dict(family="Arial", size=12, color=TEXT_DARK),
-                bgcolor="rgba(255,255,255,0.9)",
-                bordercolor=AXIS_LINE,
-                borderwidth=1,
-                borderpad=6,
-            )
-        ],
-        margin=dict(l=70, r=40, t=110, b=60),  # más espacio arriba para la anotación
+        margin=dict(l=70, r=40, t=70, b=60),
     )
     return _ejes_estandar(fig, "Mes", f"PML promedio {label_moneda()}"), años_disponibles
+
+
+def grafica_spread_ccr(df, granularidad="mensual"):
+    """Gráfica de spread por CCR — una línea continua por zona en el tiempo.
+
+    Útil cuando hay nodos de varios CCRs en la consulta.
+    Promedia todos los nodos de cada CCR por mes.
+
+    Retorna (fig, ccrs_disponibles).
+    """
+    if df.empty:
+        return None, []
+
+    ccrs_unicos = sorted([c for c in df['ccr'].unique() if c and c != "?"])
+    if len(ccrs_unicos) < 2:
+        return None, ccrs_unicos
+
+    # Pre-agregar a mensual para reducir memoria y mejorar legibilidad
+    df_work = df[['ccr', 'fecha_dt', 'pml']].copy()
+    df_work['periodo'] = df_work['fecha_dt'].dt.to_period('M').dt.to_timestamp()
+    monthly = df_work.groupby(['ccr', 'periodo'])['pml'].mean().reset_index()
+
+    # Asignar colores corporativos por CCR (consistente con paleta)
+    color_ccr = {ccr: PALETTE[i % len(PALETTE)] for i, ccr in enumerate(ccrs_unicos)}
+
+    fig = go.Figure()
+    sym = label_moneda_short()
+
+    for ccr in ccrs_unicos:
+        sub = monthly[monthly['ccr'] == ccr].sort_values('periodo')
+        if sub.empty:
+            continue
+        promedio = sub['pml'].mean()
+        fig.add_trace(go.Scatter(
+            x=sub['periodo'],
+            y=sub['pml'],
+            mode='lines+markers',
+            name=f"{ccr} (avg {sym}{promedio:.0f})",
+            line=dict(color=color_ccr[ccr], width=2.5),
+            marker=dict(color=color_ccr[ccr], size=7,
+                        line=dict(color='white', width=1)),
+            hovertemplate=f"<b>{ccr}</b><br>%{{x|%b %Y}}: {sym}%{{y:.1f}}<extra></extra>",
+        ))
+
+    fig.update_layout(**_layout_estandar(
+        f"📊 Spread mensual por CCR · {len(ccrs_unicos)} zonas comparadas", height=520))
+    fig.update_layout(
+        legend=dict(
+            orientation="v", yanchor="top", y=0.98, xanchor="right", x=0.98,
+            bgcolor="rgba(255,255,255,0.95)",
+            bordercolor=AXIS_LINE, borderwidth=1.5,
+            font=dict(family="Arial", size=11, color=TEXT_DARK),
+        ),
+        hovermode='x unified',
+    )
+    return _ejes_estandar(fig, "Mes",
+                          f"PML promedio mensual {label_moneda()}"), ccrs_unicos
 
 
 def grafica_barras_top(df, metrica="promedio", top_n=10):
@@ -2310,6 +2756,18 @@ def render_dashboard(acumulado, catalogo, matches_df=None):
         else:
             st.warning("No se pudo generar la gráfica multi-año.")
 
+    # ─── SPREAD POR CCR (solo si ≥2 CCRs distintos) ───
+    ccrs_unicos_dash = sorted([c for c in df['ccr'].unique() if c and c != "?"])
+    if len(ccrs_unicos_dash) >= 2:
+        st.markdown("### 📊 Spread mensual por CCR (zonas)")
+        st.caption(
+            f"Comparativa continua del PML promedio mensual entre **{len(ccrs_unicos_dash)} CCRs** "
+            f"presentes en tu consulta. Útil para identificar diferenciales entre zonas."
+        )
+        fig_spread, _ = grafica_spread_ccr(df)
+        if fig_spread:
+            st.plotly_chart(fig_spread, use_container_width=True)
+
     st.markdown("### 🏆 Rankings comparativos")
     tab1, tab2, tab3 = st.tabs(["Mayor PML", "Mayor volatilidad", "Más horas negativas"])
     with tab1:
@@ -2346,56 +2804,58 @@ def render_centro_descargas(acumulado, catalogo, sistema, proceso, fecha_ini, fe
     sufijo = f"_{moneda}"
     n_nodos = len(acumulado)
 
-    # ─── Selector multi-año (solo si <= 20 nodos) ───
-    nodo_multianos = None
-    df_multianos = None
+    # ─── Multi-año (todos los nodos si ≤20) ───
+    df_multianos_dict = None  # dict {nodo: df_pivot}
     incluir_multianos = False
 
     if n_nodos > 0 and n_nodos <= 20:
-        st.markdown("##### 📊 Gráfica multi-año en Excel de Análisis")
+        st.markdown("##### 📊 Gráficas multi-año en Excel de Análisis")
         st.caption(
-            f"Como tu consulta tiene **{n_nodos} nodos** (≤20), puedes incluir una gráfica nativa "
-            f"de Excel con PML promedio mensual por año. Esta gráfica se agrega como hoja extra "
-            f"al **Excel de Análisis** que descargas más abajo."
+            f"Como tu consulta tiene **{n_nodos} nodos** (≤20), el Excel de Análisis "
+            f"incluirá una hoja con gráfica nativa para **CADA nodo** mostrando el PML "
+            f"promedio mensual por año. Total: **{n_nodos} hojas con gráficas**."
         )
-        col_a, col_b = st.columns([2, 1])
-        with col_a:
-            nodos_disp = sorted(df["nodo"].unique()) if not df.empty else []
-            if nodos_disp:
-                nodo_multianos = st.selectbox(
-                    "Nodo para gráfica multi-año:",
-                    nodos_disp,
-                    key="sel_multianos_excel",
-                )
-        with col_b:
-            incluir_multianos = st.toggle(
-                "Incluir en Excel",
-                value=True,
-                key="tog_incluir_multianos",
-                help="Agrega una hoja con gráfica nativa de Excel al archivo de análisis"
-            )
+        incluir_multianos = st.toggle(
+            f"Incluir gráficas multi-año de los {n_nodos} nodos",
+            value=True,
+            key="tog_incluir_multianos",
+            help="Una hoja por nodo con tabla + gráfica de líneas nativa de Excel"
+        )
 
-        if incluir_multianos and nodo_multianos and not df.empty:
-            sub = df[df["nodo"] == nodo_multianos].copy()
-            if not sub.empty:
+        if incluir_multianos and not df.empty:
+            df_multianos_dict = {}
+            for nodo_n in sorted(df["nodo"].unique()):
+                sub = df[df["nodo"] == nodo_n].copy()
+                if sub.empty:
+                    continue
                 sub["año"] = sub["fecha_dt"].dt.year
                 sub["mes_num"] = sub["fecha_dt"].dt.month
                 pivot = sub.pivot_table(values="pml", index="mes_num",
                                           columns="año", aggfunc="mean").round(2)
-                df_multianos = pivot.reset_index()
-                años_count = len([c for c in df_multianos.columns if c != 'mes_num'])
+                df_multianos_dict[str(nodo_n)] = pivot.reset_index()
+
+            # Mostrar resumen de años disponibles
+            sample_keys = list(df_multianos_dict.keys())[:1]
+            if sample_keys:
+                años_count = len([c for c in df_multianos_dict[sample_keys[0]].columns
+                                   if c != 'mes_num'])
                 if años_count >= 2:
-                    st.success(f"✅ Gráfica con **{años_count} años** lista. "
-                                f"Descarga el Excel de Análisis abajo para verla.")
+                    st.success(
+                        f"✅ {n_nodos} gráficas con **{años_count} años cada una** listas "
+                        f"para incluirse en el Excel de Análisis."
+                    )
                 else:
-                    st.info(f"ℹ️ Solo hay datos de **1 año** en tu consulta. "
-                            f"La gráfica multi-año necesita rangos de fechas que cubran ≥2 años.")
+                    st.info(
+                        f"ℹ️ Solo hay datos de **1 año** en la consulta. La gráfica "
+                        f"multi-año se incluirá pero tendrá una sola línea. Para "
+                        f"comparar años, consulta un período más largo."
+                    )
 
     elif n_nodos > 20:
         st.info(
-            f"⚠️ Tu consulta tiene **{n_nodos} nodos**. "
-            f"La gráfica multi-año solo se incluye automáticamente si hay ≤20 nodos. "
-            f"Si quieres la gráfica para un nodo específico, reduce tu consulta."
+            f"⚠️ Tu consulta tiene **{n_nodos} nodos**. Las gráficas multi-año "
+            f"solo se incluyen automáticamente si hay ≤20 nodos (para mantener el "
+            f"Excel manejable). Reduce tu consulta si quieres incluirlas."
         )
 
     st.markdown("##### 📦 Tipos de archivos disponibles")
@@ -2453,8 +2913,7 @@ def render_centro_descargas(acumulado, catalogo, sistema, proceso, fecha_ini, fe
                     st.session_state["excel_analisis_bytes"] = generar_excel_analisis(
                         df_metricas, df_resumen, sistema, proceso, fecha_ini, fecha_fin,
                         moneda=moneda, tc_info=tc_info,
-                        df_multianos=df_multianos if incluir_multianos else None,
-                        nodo_multianos=nodo_multianos if incluir_multianos else None)
+                        df_multianos=df_multianos_dict if incluir_multianos else None)
         if st.session_state["excel_analisis_bytes"]:
             st.download_button(
                 label="📥 Descargar archivo",
@@ -2492,6 +2951,92 @@ def render_centro_descargas(acumulado, catalogo, sistema, proceso, fecha_ini, fe
                         use_container_width=True,
                     )
 
+    # ─── EXCEL CUSTOM ───
+    st.divider()
+    st.markdown("##### 🎨 Excel Custom — descarga personalizada")
+    st.caption(
+        "Selecciona qué secciones incluir en un Excel a la medida. "
+        "Cada toggle agrega o quita una hoja del archivo final."
+    )
+
+    # Detectar disponibilidad de cada opción
+    n_nodos_actual = df["nodo"].nunique() if not df.empty else 0
+    ccrs_unicos_cust = sorted([c for c in df['ccr'].unique() if c and c != "?"]) if not df.empty else []
+    multiano_disponible = (n_nodos_actual > 0 and n_nodos_actual <= 20)
+
+    cc1, cc2, cc3 = st.columns(3)
+    with cc1:
+        opt_resumen = st.toggle("📋 Resumen estadístico", value=True, key="cust_resumen")
+        opt_top_pml = st.toggle("🏆 Top PML promedio", value=False, key="cust_top_pml")
+        opt_top_vol = st.toggle("📊 Top volatilidad", value=False, key="cust_top_vol")
+    with cc2:
+        opt_arb = st.toggle("💰 BESS Arbitraje", value=False, key="cust_arb")
+        opt_ssaa = st.toggle("⚙️ BESS SSAA", value=False, key="cust_ssaa")
+        opt_firm = st.toggle("🌅 BESS Firming", value=False, key="cust_firm")
+    with cc3:
+        opt_multi = st.toggle(
+            f"📈 Multi-año ({n_nodos_actual} hojas)" if multiano_disponible else "📈 Multi-año (>20 nodos no)",
+            value=False, disabled=not multiano_disponible, key="cust_multi"
+        )
+        spread_label = (f"📊 Spread CCR ({len(ccrs_unicos_cust)} zonas)"
+                         if len(ccrs_unicos_cust) >= 2 else "📊 Spread CCR (necesita ≥2 CCRs)")
+        opt_spread = st.toggle(spread_label, value=False,
+                                disabled=len(ccrs_unicos_cust) < 2, key="cust_spread")
+
+    opciones_custom = {
+        "resumen": opt_resumen,
+        "multiano": opt_multi,
+        "spread_ccr": opt_spread,
+        "bess_arbitraje": opt_arb,
+        "bess_ssaa": opt_ssaa,
+        "bess_firming": opt_firm,
+        "top_pml": opt_top_pml,
+        "top_volatilidad": opt_top_vol,
+    }
+    n_opciones = sum(1 for v in opciones_custom.values() if v)
+
+    if n_opciones == 0:
+        st.info("ℹ️ Selecciona al menos una sección arriba para generar el Excel Custom.")
+    else:
+        st.caption(f"✅ **{n_opciones} secciones** seleccionadas para el Excel Custom.")
+
+        # Construir df_multianos_dict si está activo
+        df_multi_for_custom = None
+        if opt_multi and multiano_disponible:
+            df_multi_for_custom = {}
+            for nodo_n in sorted(df["nodo"].unique()):
+                sub = df[df["nodo"] == nodo_n].copy()
+                if sub.empty:
+                    continue
+                sub["año"] = sub["fecha_dt"].dt.year
+                sub["mes_num"] = sub["fecha_dt"].dt.month
+                pivot = sub.pivot_table(values="pml", index="mes_num",
+                                          columns="año", aggfunc="mean").round(2)
+                df_multi_for_custom[str(nodo_n)] = pivot.reset_index()
+
+        if "excel_custom_bytes" not in st.session_state:
+            st.session_state["excel_custom_bytes"] = None
+
+        if st.button("🎨 Generar Excel Custom", key="btn_gen_custom",
+                      type="primary", use_container_width=True):
+            with st.spinner(f"Generando Excel Custom con {n_opciones} secciones..."):
+                st.session_state["excel_custom_bytes"] = generar_excel_custom(
+                    df, df_resumen, df_metricas, opciones_custom,
+                    sistema, proceso, fecha_ini, fecha_fin,
+                    moneda=moneda, tc_info=tc_info,
+                    df_multianos_dict=df_multi_for_custom,
+                )
+
+        if st.session_state["excel_custom_bytes"]:
+            st.download_button(
+                label="📥 Descargar Excel Custom",
+                data=st.session_state["excel_custom_bytes"],
+                file_name=f"PML_CENACE_Custom{sufijo}_{sistema}_{ts}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="dl_custom",
+                use_container_width=True,
+            )
+
 
 # ═══════════════════════════════════════════════════════════════════════
 # UI PRINCIPAL
@@ -2524,7 +3069,12 @@ if "consulta_params" not in st.session_state:
     st.session_state["consulta_params"] = {}
 
 with st.sidebar:
-    st.markdown("### ⚙️ Configuración")
+    st.markdown(
+        f"<h2 style='color:{TEXT_TITLE};margin-bottom:0;'>"
+        f"⚡🔋 Node Analyzer</h2>",
+        unsafe_allow_html=True,
+    )
+    st.caption("Configuración")
 
     st.markdown("**🚀 Modo de uso**")
     modo = st.radio(
@@ -2545,10 +3095,10 @@ with st.sidebar:
     necesita_datos = es_solo_datos or es_completo
     necesita_mapa = es_solo_mapa or es_completo
 
-    # Selector de moneda — solo si se usan datos
+    # FX Selector — solo si se usan datos
     if necesita_datos:
         st.markdown("---")
-        st.markdown("**💱 Moneda del análisis**")
+        st.markdown("**💱 FX Selector**")
         moneda_sel = st.radio(
             "Moneda:",
             options=["🇲🇽 MXN (pesos)", "🇺🇸 USD (dólares)"],
@@ -2579,6 +3129,10 @@ with st.sidebar:
         placeholder="01VAJ-230\n01XAL-230\n06FUN-115",
         key="nodos_input",
     )
+
+    # Badge si los nodos vinieron del filtro
+    if st.session_state.get("nodos_from_filter"):
+        st.caption(f"📍 **{st.session_state['nodos_from_filter']} nodos del filtro**")
 
     # ─── SELECTOR JERÁRQUICO ───
     with st.expander("🔍 Buscar nodos por filtros (Estado / Zona / CCR / kV)"):
@@ -2644,37 +3198,59 @@ with st.sidebar:
                     if len(df_f) > 100:
                         st.caption(f"⚠️ Mostrando solo los primeros 100 (refina filtros para ver todos)")
 
-                    # Botón para agregar al textarea
-                    if st.button(f"✅ Agregar {len(df_f)} nodos al textarea", key="btn_add_nodos"):
+                    # Botón para agregar al textarea — limpia consulta previa
+                    if st.button(f"✅ Agregar {len(df_f)} nodos (reemplaza textarea)",
+                                 key="btn_add_nodos"):
                         nuevas_claves = "\n".join(df_f['clave'].tolist())
-                        actuales = nodos_input.strip()
-                        if actuales:
-                            st.session_state["nodos_pending"] = actuales + "\n" + nuevas_claves
-                        else:
-                            st.session_state["nodos_pending"] = nuevas_claves
+                        # Reemplazar (no concatenar) para que sea predecible
+                        st.session_state["nodos_pending"] = nuevas_claves
+                        st.session_state["nodos_from_filter"] = len(df_f)
+                        # Limpiar resultado de consulta anterior (forzar re-ejecutar)
+                        for k in ("consulta_ejecutada", "acumulado", "matches_df",
+                                  "fx_info", "consulta_params",
+                                  "excel_datos_bytes", "excel_analisis_bytes",
+                                  "excel_custom_bytes", "kmz_bytes"):
+                            if k in st.session_state:
+                                if k == "consulta_ejecutada":
+                                    st.session_state[k] = False
+                                else:
+                                    st.session_state[k] = None
                         st.rerun()
         else:
             st.warning("No hay catálogo cargado para filtrar.")
 
     if necesita_datos:
-        col1, col2 = st.columns(2)
-        with col1:
-            sistema = st.selectbox("Sistema", ["SIN", "BCA", "BCS"], index=0, key="sistema_sel")
-        with col2:
-            proceso = st.selectbox("Proceso", ["MTR", "MDA"], index=0, key="proceso_sel")
+        # Solo proceso MTR/MDA — Sistema se auto-detecta del catálogo
+        proceso = st.selectbox("⚙️ Proceso", ["MTR", "MDA"], index=0, key="proceso_sel",
+                                 help="**MTR** = Mercado en Tiempo Real (precios reales). "
+                                      "**MDA** = Mercado del Día en Adelante (pronosticados).")
+        st.caption("ℹ️ Sistema (SIN/BCA/BCS) se auto-detecta de cada nodo desde el catálogo.")
 
         st.markdown("**📅 Período**")
         col_f1, col_f2 = st.columns(2)
         today = date.today()
+        # Default: hoy −2 semanas (delay típico CENACE) hasta hoy −1 día
         with col_f1:
-            f_ini = st.date_input("Desde", value=today - timedelta(days=90), max_value=today, key="f_ini")
+            f_ini = st.date_input("Desde", value=today - timedelta(days=90),
+                                    max_value=today, key="f_ini")
         with col_f2:
-            f_fin = st.date_input("Hasta", value=today - timedelta(days=1), max_value=today, key="f_fin")
+            f_fin = st.date_input("Hasta", value=today - timedelta(days=14),
+                                    max_value=today, key="f_fin",
+                                    help="CENACE típicamente tiene delay de 1-2 semanas.")
+
+        # Warning si fin > hoy −7 días
+        if f_fin > today - timedelta(days=7):
+            st.caption(
+                "⚠️ La fecha fin es muy reciente. CENACE suele publicar con delay de 1-2 semanas. "
+                "Podrías recibir datos parciales."
+            )
+        sistema = None  # auto-detect
     else:
-        sistema = "SIN"; proceso = "MTR"
+        proceso = "MTR"
+        sistema = None
         today = date.today()
         f_ini = today - timedelta(days=90)
-        f_fin = today - timedelta(days=1)
+        f_fin = today - timedelta(days=14)
 
     # Toggle de geocodificación en modo solo datos
     if es_solo_datos:
@@ -2687,6 +3263,28 @@ with st.sidebar:
         incluir_geo_solo_datos = False
 
     st.divider()
+
+    # Botón limpiar todo
+    if st.button("🧹 Limpiar todo", key="btn_clear_all", use_container_width=True,
+                  help="Reset completo: borra textarea, filtros, datos descargados y descargas pendientes."):
+        # Limpiar todo el session_state
+        keys_to_clear = [
+            "consulta_ejecutada", "acumulado", "matches_df", "fx_info",
+            "consulta_params", "nodos_input", "nodos_pending", "nodos_from_filter",
+            "excel_datos_bytes", "excel_analisis_bytes", "excel_custom_bytes",
+            "kmz_bytes", "moneda",
+            # Filtros
+            "filt_sis", "filt_est", "filt_mun", "filt_zona", "filt_ccr",
+            "filt_kv", "filt_buscar",
+            # Selectores
+            "sel_heatmap", "sel_multiano", "sel_multianos_excel",
+            "tog_incluir_multianos", "conf_grande",
+        ]
+        for k in keys_to_clear:
+            if k in st.session_state:
+                del st.session_state[k]
+        st.rerun()
+
     with st.expander("📤 Actualizar catálogo de nodos"):
         st.caption(
             "El catálogo se actualiza ~1 vez al mes. Si tienes una versión más nueva, "
@@ -2881,14 +3479,22 @@ if boton and nodos:
 
             progress = st.progress(0, text="Iniciando descarga...")
             def cb(done, total):
-                progress.progress(done/total,
-                                  text=f"Descargando: {done}/{total} ({done/total*100:.0f}%)")
+                progress.progress(min(done/total, 1.0) if total > 0 else 0,
+                                  text=f"Descargando: {done}/{total} ({(done/total*100 if total>0 else 0):.0f}%)")
 
             with st.spinner("Consultando CENACE..."):
-                acumulado, errores = descargar_pml(
-                    nodos, fecha_ini, fecha_fin, sistema, proceso, progress_cb=cb,
+                acumulado, errores, info_sistemas, nodos_sin_sis = descargar_pml_auto(
+                    nodos, fecha_ini, fecha_fin, proceso, catalogo, progress_cb=cb,
                 )
             progress.progress(1.0, text="✅ Datos descargados")
+
+            # Mostrar info de sistemas auto-detectados
+            if len(info_sistemas) > 1:
+                sistemas_str = " · ".join(f"{s}: {n}" for s, n in info_sistemas.items())
+                st.info(f"🔄 Multi-sistema detectado: {sistemas_str}")
+            if nodos_sin_sis:
+                st.caption(f"⚠️ {len(nodos_sin_sis)} nodos no estaban en el catálogo. "
+                           f"Se asumió SIN como fallback.")
 
             if not acumulado:
                 st.error("❌ No se recibieron datos PML.")
@@ -2962,12 +3568,17 @@ if boton and nodos:
                     matches_df = pd.DataFrame(resultados)
 
         # Guardar todo en session_state
+        # Sistema: si solo 1 → ese; si multi → "MULTI" + dict
+        sistema_str = "MULTI" if len(info_sistemas or {}) > 1 else (
+            list(info_sistemas.keys())[0] if info_sistemas else "SIN"
+        )
         st.session_state["consulta_ejecutada"] = True
         st.session_state["acumulado"] = acumulado
         st.session_state["matches_df"] = matches_df
         st.session_state["fx_info"] = fx_info
         st.session_state["consulta_params"] = {
-            "sistema": sistema, "proceso": proceso,
+            "sistema": sistema_str, "proceso": proceso,
+            "info_sistemas": info_sistemas,
             "fecha_ini": fecha_ini, "fecha_fin": fecha_fin,
             "modo": modo, "errores": errores,
             "tiempo": time.time() - t0,
@@ -3011,8 +3622,8 @@ if st.session_state.get("consulta_ejecutada"):
         f_fin_str = f_fin.strftime("%Y/%m/%d")
         if f_ini_str != params.get("fecha_ini") or f_fin_str != params.get("fecha_fin"):
             parametros_cambiaron.append("fechas")
-        if sistema != params.get("sistema") or proceso != params.get("proceso"):
-            parametros_cambiaron.append(f"{sistema}/{proceso}")
+        if proceso != params.get("proceso"):
+            parametros_cambiaron.append(f"proceso ({params.get('proceso')} → {proceso})")
 
     # Validar si los datos actuales sirven para el modo actual
     modo_requiere_datos = ("📊" in modo_cur or "🔬" in modo_cur)
