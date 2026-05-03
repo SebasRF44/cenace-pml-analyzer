@@ -27,6 +27,7 @@ import time
 import io
 import os
 import re
+import gc
 import zipfile
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, date
@@ -1426,27 +1427,45 @@ def generar_kmz(matches_df):
 # ═══════════════════════════════════════════════════════════════════════
 @st.cache_data(show_spinner=False, max_entries=3)
 def acumulado_a_dataframe_cached(acumulado_id, _acumulado, _catalogo):
-    """Convierte acumulado a DF. acumulado_id es un hash para cache key."""
+    """Convierte acumulado a DF con tipos optimizados para memoria."""
     rows = []
     for nodo, filas in _acumulado.items():
         info = _catalogo.get(nodo, {}) if _catalogo else {}
+        ccr = info.get("ccr", "?")
+        nombre = info.get("nombre", nodo)
+        estado = info.get("estado", "")
         for f in filas:
             try: pml_val = float(f["pml"])
             except (TypeError, ValueError): continue
             rows.append({
                 "nodo":   nodo,
-                "ccr":    info.get("ccr", "?"),
-                "nombre": info.get("nombre", nodo),
-                "estado": info.get("estado", ""),
+                "ccr":    ccr,
+                "nombre": nombre,
+                "estado": estado,
                 "fecha":  f["fecha"],
                 "hora":   int(f["hora"]) if f["hora"] else 0,
                 "pml":    pml_val,
             })
     df = pd.DataFrame(rows)
+    rows = None  # liberar memoria de la lista
+    gc.collect()
+
     if not df.empty:
+        # Convertir a categorical para ahorrar memoria (string columnas repetitivas)
+        df["nodo"] = df["nodo"].astype('category')
+        df["ccr"] = df["ccr"].astype('category')
+        df["nombre"] = df["nombre"].astype('category')
+        df["estado"] = df["estado"].astype('category')
+        df["hora"] = df["hora"].astype('int8')
+        df["pml"] = df["pml"].astype('float32')  # vs float64 por defecto = 50% menos memoria
+
         df["fecha_dt"] = pd.to_datetime(df["fecha"], errors="coerce")
-        df["mes"] = df["fecha_dt"].dt.month
-        df["mes_nombre"] = df["fecha_dt"].dt.strftime("%b %Y")
+        df["mes"] = df["fecha_dt"].dt.month.astype('int8')
+        df["mes_nombre"] = df["fecha_dt"].dt.strftime("%b %Y").astype('category')
+
+        # Drop la columna fecha string (redundante con fecha_dt) — ahorra mucha memoria
+        df = df.drop(columns=["fecha"])
+        gc.collect()
     return df
 
 
@@ -1659,14 +1678,44 @@ def grafica_pml_multiano(df, nodo_seleccionado):
         ))
 
     fig.update_layout(**_layout_estandar(
-        f"📊 PML promedio mensual · {nodo_seleccionado}", height=480))
+        f"📊 PML promedio mensual · {nodo_seleccionado}", height=520))
+
+    # Leyenda con dot de color por año (data label visual)
+    # Plotly genera la leyenda automáticamente con el color de la traza,
+    # así que agregamos anotación adicional con bullets coloreados arriba a la izquierda
+    annot_html = ""
+    for año in años_disponibles:
+        if año in color_anos and año in promedios_anuales:
+            color = color_anos[año]
+            sym = label_moneda_short()
+            annot_html += (
+                f"<span style='color:{color};font-size:18px'>●</span> "
+                f"<b>{año}: {sym}{promedios_anuales[año]:.0f}/MWh</b>   "
+            )
+
     fig.update_layout(
         legend=dict(
             orientation="v", yanchor="top", y=0.98, xanchor="right", x=0.98,
             bgcolor="rgba(255,255,255,0.95)",
             bordercolor=AXIS_LINE, borderwidth=1.5,
-            font=dict(family="Arial", size=11, color=TEXT_DARK),
+            font=dict(family="Arial", size=12, color=TEXT_DARK),
+            itemsizing='constant',  # mantiene el dot del color visible
         ),
+        annotations=[
+            dict(
+                xref='paper', yref='paper',
+                x=0.02, y=1.08,
+                xanchor='left', yanchor='top',
+                showarrow=False,
+                text=annot_html,
+                font=dict(family="Arial", size=12, color=TEXT_DARK),
+                bgcolor="rgba(255,255,255,0.9)",
+                bordercolor=AXIS_LINE,
+                borderwidth=1,
+                borderpad=6,
+            )
+        ],
+        margin=dict(l=70, r=40, t=110, b=60),  # más espacio arriba para la anotación
     )
     return _ejes_estandar(fig, "Mes", f"PML promedio {label_moneda()}"), años_disponibles
 
@@ -2190,7 +2239,9 @@ def render_dashboard(acumulado, catalogo, matches_df=None):
             cm3.metric("🥉 Aceptable", n_ace)
 
             fig_mapa = grafica_mapa(matches_df, df, color_by='pml')
-            if fig_mapa: st.plotly_chart(fig_mapa, use_container_width=True)
+            if fig_mapa:
+                st.plotly_chart(fig_mapa, use_container_width=True,
+                                config={'scrollZoom': True, 'displayModeBar': True})
 
             # Leyenda CCR
             render_leyenda_ccr(matches_df)
@@ -2303,8 +2354,9 @@ def render_centro_descargas(acumulado, catalogo, sistema, proceso, fecha_ini, fe
     if n_nodos > 0 and n_nodos <= 20:
         st.markdown("##### 📊 Gráfica multi-año en Excel de Análisis")
         st.caption(
-            f"Como tu consulta tiene **{n_nodos} nodos** (≤20), puedes incluir una gráfica de "
-            f"PML promedio mensual por año en el Excel de Análisis. Selecciona el nodo:"
+            f"Como tu consulta tiene **{n_nodos} nodos** (≤20), puedes incluir una gráfica nativa "
+            f"de Excel con PML promedio mensual por año. Esta gráfica se agrega como hoja extra "
+            f"al **Excel de Análisis** que descargas más abajo."
         )
         col_a, col_b = st.columns([2, 1])
         with col_a:
@@ -2320,7 +2372,7 @@ def render_centro_descargas(acumulado, catalogo, sistema, proceso, fecha_ini, fe
                 "Incluir en Excel",
                 value=True,
                 key="tog_incluir_multianos",
-                help="Agrega una hoja con gráfica nativa de Excel"
+                help="Agrega una hoja con gráfica nativa de Excel al archivo de análisis"
             )
 
         if incluir_multianos and nodo_multianos and not df.empty:
@@ -2331,6 +2383,13 @@ def render_centro_descargas(acumulado, catalogo, sistema, proceso, fecha_ini, fe
                 pivot = sub.pivot_table(values="pml", index="mes_num",
                                           columns="año", aggfunc="mean").round(2)
                 df_multianos = pivot.reset_index()
+                años_count = len([c for c in df_multianos.columns if c != 'mes_num'])
+                if años_count >= 2:
+                    st.success(f"✅ Gráfica con **{años_count} años** lista. "
+                                f"Descarga el Excel de Análisis abajo para verla.")
+                else:
+                    st.info(f"ℹ️ Solo hay datos de **1 año** en tu consulta. "
+                            f"La gráfica multi-año necesita rangos de fechas que cubran ≥2 años.")
 
     elif n_nodos > 20:
         st.info(
@@ -2470,18 +2529,18 @@ with st.sidebar:
     st.markdown("**🚀 Modo de uso**")
     modo = st.radio(
         "Selecciona qué hacer:",
-        options=["🔬 Análisis", "📊 Solo datos", "🗺️ Solo mapa"],
+        options=["🔬 Análisis", "📊 Datos", "🗺️ Mapa"],
         index=0,
         help=(
             "**Análisis**: descarga + dashboard + mapa + BESS scoring (sin Excel)\n\n"
-            "**Solo datos**: descarga + Centro de descargas (Excel/KMZ)\n\n"
-            "**Solo mapa**: solo geocodifica (~5 segundos)"
+            "**Datos**: descarga + Centro de descargas (Excel/KMZ)\n\n"
+            "**Mapa**: solo geocodifica (~5 segundos)"
         ),
         label_visibility="collapsed",
     )
 
-    es_solo_mapa = (modo == "🗺️ Solo mapa")
-    es_solo_datos = (modo == "📊 Solo datos")
+    es_solo_mapa = (modo == "🗺️ Mapa")
+    es_solo_datos = (modo == "📊 Datos")
     es_completo = (modo == "🔬 Análisis")
     necesita_datos = es_solo_datos or es_completo
     necesita_mapa = es_solo_mapa or es_completo
@@ -2507,6 +2566,13 @@ with st.sidebar:
 
     st.markdown("---")
     st.markdown("**📍 Nodos CENACE**")
+
+    # Procesar pending del botón "Agregar al textarea" (debe ir ANTES del text_area)
+    if "nodos_pending" in st.session_state and st.session_state["nodos_pending"]:
+        # Mover de pending al input
+        st.session_state["nodos_input"] = st.session_state["nodos_pending"]
+        st.session_state["nodos_pending"] = ""
+
     nodos_input = st.text_area(
         "Lista de claves",
         height=120,
@@ -2583,9 +2649,9 @@ with st.sidebar:
                         nuevas_claves = "\n".join(df_f['clave'].tolist())
                         actuales = nodos_input.strip()
                         if actuales:
-                            st.session_state["nodos_input"] = actuales + "\n" + nuevas_claves
+                            st.session_state["nodos_pending"] = actuales + "\n" + nuevas_claves
                         else:
-                            st.session_state["nodos_input"] = nuevas_claves
+                            st.session_state["nodos_pending"] = nuevas_claves
                         st.rerun()
         else:
             st.warning("No hay catálogo cargado para filtrar.")
@@ -2632,18 +2698,37 @@ with st.sidebar:
             key="cat_upload",
             help="Archivo `Catálogo_NodosP_Sistema_Eléctrico_Nacional` del portal CENACE",
         )
+
+        # Flag para evitar reprocesar el mismo archivo en cada rerun
         if uploaded_cat is not None:
-            file_bytes = uploaded_cat.read()
-            new_cat = cargar_catalogo_uploaded(file_bytes)
-            if new_cat:
-                st.session_state["catalogo_uploaded"] = new_cat
-                st.success(f"✅ Catálogo actualizado: **{len(new_cat):,} nodos**")
-                st.rerun()
+            file_id = f"{uploaded_cat.name}_{uploaded_cat.size}"
+            last_processed = st.session_state.get("cat_last_processed", "")
+            if file_id != last_processed:
+                # Solo procesar si es un archivo distinto al ya procesado
+                file_bytes = uploaded_cat.read()
+                new_cat = cargar_catalogo_uploaded(file_bytes)
+                if new_cat:
+                    st.session_state["catalogo_uploaded"] = new_cat
+                    st.session_state["cat_last_processed"] = file_id
+                    st.success(
+                        f"✅ Catálogo actualizado: **{len(new_cat):,} nodos**. "
+                        f"Aplica desde la próxima interacción."
+                    )
+                else:
+                    st.error("❌ No se pudo leer el archivo. Verifica que sea el catálogo CENACE oficial.")
+                    st.session_state["cat_last_processed"] = file_id  # marcar como procesado para no reintentar
             else:
-                st.error("❌ No se pudo leer el archivo. Verifica que sea el catálogo CENACE oficial.")
+                # Ya procesado: solo mostrar el estado actual
+                if st.session_state.get("catalogo_uploaded"):
+                    st.success(
+                        f"✅ Catálogo actualizado en esta sesión: "
+                        f"**{len(st.session_state['catalogo_uploaded']):,} nodos**"
+                    )
+
         if "catalogo_uploaded" in st.session_state and st.session_state["catalogo_uploaded"]:
             if st.button("🔄 Volver al catálogo default", key="btn_reset_cat"):
                 st.session_state["catalogo_uploaded"] = None
+                st.session_state["cat_last_processed"] = ""
                 st.rerun()
 
     st.caption("Sebastian Roldan (SRF)\nRecurrent Energy · Canadian Solar")
@@ -2655,8 +2740,8 @@ with col_left:
 
     modo_descripcion = {
         "🔬 Análisis": "Descargará datos PML + mapeará nodos + dashboard + BESS scoring (sin Excel).",
-        "📊 Solo datos": "Descargará datos PML y mostrará un Centro de Descargas con Excel/KMZ.",
-        "🗺️ Solo mapa": ("Solo localizará los nodos en OpenStreetMap. <b>Sin descargar PML.</b>"),
+        "📊 Datos": "Descargará datos PML y mostrará un Centro de Descargas con Excel/KMZ.",
+        "🗺️ Mapa": ("Solo localizará los nodos en OpenStreetMap. <b>Sin descargar PML.</b>"),
     }
     st.markdown(
         f"<div class='mode-badge'><b>Modo: {modo}</b><br>{modo_descripcion[modo]}</div>",
@@ -2698,26 +2783,26 @@ with col_left:
 
     if n_nodos > 0:
         if es_solo_mapa:
-            # Solo mapa permite hasta 2500 (es ligero)
+            # Modo Mapa permite hasta 2500 (es ligero)
             if n_nodos > 2500:
                 st.error(
-                    f"🔴 **{n_nodos} nodos** es demasiado para procesar incluso en modo Solo Mapa. "
+                    f"🔴 **{n_nodos} nodos** es demasiado para procesar incluso en modo Mapa. "
                     f"Por estabilidad, sugiero dividir en consultas menores a 2500 nodos."
                 )
                 bloqueo_duro = True
             elif n_nodos > 500:
                 st.warning(
                     f"⚠️ **{n_nodos} nodos** es una consulta grande. "
-                    f"Solo Mapa puede tomar 30-60s. Si quieres datos PML, divide en partes."
+                    f"Modo Mapa puede tomar 30-60s. Si quieres datos PML, divide en partes."
                 )
         else:
-            # Modo Análisis o Solo Datos: límites más estrictos
+            # Modo Análisis o Datos: límites más estrictos
             if n_nodos > 300:
                 st.error(
-                    f"🔴 **{n_nodos} nodos** excede el límite recomendado para Análisis/Solo Datos. "
+                    f"🔴 **{n_nodos} nodos** excede el límite recomendado para Análisis/Datos. "
                     f"La app web puede colgarse por OOM (limite 1GB RAM en Streamlit Cloud Free). "
                     f"Sugiero dividir en consultas de 100-200 nodos. "
-                    f"💡 Si solo quieres ver dónde están en el mapa, usa modo **🗺️ Solo Mapa** "
+                    f"💡 Si solo quieres ver dónde están en el mapa, usa modo **🗺️ Mapa** "
                     f"(soporta hasta 2500 nodos)."
                 )
                 bloqueo_duro = True
@@ -2980,6 +3065,17 @@ if st.session_state.get("consulta_ejecutada"):
             with st.expander(f"⚠️ {len(params['errores'])} errores en consultas"):
                 st.dataframe(pd.DataFrame(params["errores"][:20]), use_container_width=True)
 
+        # Aviso de Colab para consultas pesadas (multi-año + muchos nodos)
+        # Umbral: > 1.3M filas (~150 nodos × 1 año equivalente)
+        if n_total > 1_300_000:
+            st.warning(
+                f"⚠️ **Consulta pesada detectada** ({n_total:,} filas). "
+                f"Para análisis multi-año con ≥150 nodos, te recomiendo usar el "
+                f"**notebook Colab v64** que tiene 12 GB de RAM disponibles "
+                f"vs 1 GB de Streamlit Cloud Free. La app web puede volverse lenta "
+                f"o crashearse al generar gráficos pesados."
+            )
+
     # Render según modo
     if "🗺️" in modo_cur:
         # Solo mapa
@@ -2995,7 +3091,9 @@ if st.session_state.get("consulta_ejecutada"):
 
             if n_mapeados > 0:
                 fig_mapa = grafica_mapa(matches_df, color_by='ccr')
-                if fig_mapa: st.plotly_chart(fig_mapa, use_container_width=True)
+                if fig_mapa:
+                    st.plotly_chart(fig_mapa, use_container_width=True,
+                                    config={'scrollZoom': True, 'displayModeBar': True})
                 render_leyenda_ccr(matches_df)
                 render_panel_ccr(matches_df, None)
 
