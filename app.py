@@ -3070,8 +3070,8 @@ if "consulta_params" not in st.session_state:
 
 with st.sidebar:
     st.markdown(
-        f"<h2 style='color:{RE_RED};margin-bottom:0;font-weight:700;'>"
-        f"⚡🔋 Node Analyzer</h2>",
+        f"<h2 style='color:{RE_BLUE};margin-bottom:0;font-weight:700;'>"
+        f"⚡🔋 Node Settings</h2>",
         unsafe_allow_html=True,
     )
     st.caption("Configuración")
