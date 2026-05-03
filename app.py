@@ -1,16 +1,15 @@
 """
-CENACE PML Analyzer — Streamlit Cloud Edition  v5
+CENACE PML Analyzer — Streamlit Cloud Edition  v6
 ======================================================
 Recurrent Energy / Canadian Solar — SRF · Sebastian Roldan
 
-v5 changes vs v4:
-- Estado persistente con st.session_state (no se reinicia al cambiar scoring)
-- Modo Completo: solo dashboard analítico (sin Excel)
-- Modo Solo Datos: Centro de descargas con Excel datos + Excel análisis + KMZ opcional
-- Workers fijo en 8 (sin slider)
-- Optimizaciones de memoria y caching
-- Leyenda de CCR en el mapa
-- BESS scoring también descargable como Excel
+v6 changes vs v5:
+- Selector de moneda MXN / USD con conversión vía Banxico FIX
+- Toggle global en sidebar afecta TODA la app (gráficas, tablas, Excel)
+- TC histórico día por día (serie SF43718 de Banxico)
+- Para días sin publicación (fines de semana, feriados): último día hábil
+- Token Banxico se lee desde st.secrets (NO del código)
+- Header muestra TC promedio del período cuando se está en USD
 """
 
 import streamlit as st
@@ -70,6 +69,40 @@ PALETTE = [
     "#ff5722", "#00897b", "#c2185b", "#3949ab", "#5d4037",
     "#1976d2", "#558b2f", "#f57c00", "#8e24aa", "#455a64",
 ]
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# MONEDA — helpers para el selector MXN / USD
+# ═══════════════════════════════════════════════════════════════════════
+def get_moneda():
+    """Retorna 'MXN' o 'USD' según session_state."""
+    return st.session_state.get("moneda", "MXN")
+
+
+def simbolo_moneda():
+    """Retorna '$' (MXN) o 'USD$' para diferenciarlos visualmente."""
+    return "USD$" if get_moneda() == "USD" else "$"
+
+
+def fmt_moneda():
+    """Retorna formato Streamlit dataframe column compatible: '$%.2f' o 'USD$%.2f'."""
+    if get_moneda() == "USD":
+        return "USD$%.2f"
+    return "$%.2f"
+
+
+def label_moneda():
+    """Retorna label completo: '($/MWh)' o '(USD$/MWh)'."""
+    if get_moneda() == "USD":
+        return "(USD$/MWh)"
+    return "($/MWh)"
+
+
+def label_moneda_short():
+    """Retorna label corto sin /MWh."""
+    if get_moneda() == "USD":
+        return "USD$"
+    return "$"
 
 C_HEADER = "0e346b"
 C_SUB    = "2777bd"
@@ -238,6 +271,114 @@ out center tags;
             'rating': tags.get('rating', ''),
         })
     return subs
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# FX — TIPO DE CAMBIO BANXICO (FIX serie SF43718)
+# ═══════════════════════════════════════════════════════════════════════
+BANXICO_API_BASE = "https://www.banxico.org.mx/SieAPIRest/service/v1/series"
+SERIE_FIX_USD = "SF43718"  # Tipo de cambio FIX peso-dólar
+
+
+@st.cache_data(show_spinner=False, ttl=86400)  # 24h cache
+def cargar_fx_banxico(fecha_ini_yyyymmdd, fecha_fin_yyyymmdd, _token):
+    """Descarga serie histórica del FIX entre dos fechas.
+
+    Retorna dict {fecha_str: tipo_cambio_float} o {} si falla.
+    Las fechas son en formato YYYY-MM-DD.
+    """
+    if not _token:
+        return {}
+
+    url = (f"{BANXICO_API_BASE}/{SERIE_FIX_USD}/datos/"
+           f"{fecha_ini_yyyymmdd}/{fecha_fin_yyyymmdd}"
+           f"?mediaType=json")
+    headers = {'Bmx-Token': _token, 'Accept': 'application/json'}
+
+    try:
+        r = requests.get(url, headers=headers, timeout=30)
+        if r.status_code != 200:
+            return {}
+        data = r.json()
+        series = data.get('bmx', {}).get('series', [])
+        if not series:
+            return {}
+        datos = series[0].get('datos', [])
+    except Exception:
+        return {}
+
+    fx_dict = {}
+    for d in datos:
+        fecha_raw = d.get('fecha', '')  # formato dd/mm/yyyy
+        valor_raw = d.get('dato', '')
+        if not fecha_raw or not valor_raw or valor_raw == 'N/E':
+            continue
+        try:
+            # convertir dd/mm/yyyy -> yyyy-mm-dd
+            day, month, year = fecha_raw.split('/')
+            fecha_norm = f"{year}-{month.zfill(2)}-{day.zfill(2)}"
+            fx_dict[fecha_norm] = float(valor_raw)
+        except (ValueError, AttributeError):
+            continue
+    return fx_dict
+
+
+def construir_fx_lookup(fx_dict, fechas_necesarias):
+    """Para fechas sin TC (fines de semana, feriados), usa el último día hábil disponible.
+
+    Retorna dict {fecha_str: tc_aplicable}.
+    """
+    if not fx_dict:
+        return {}
+
+    # Ordenar fechas disponibles
+    fechas_disponibles = sorted(fx_dict.keys())
+    if not fechas_disponibles:
+        return {}
+
+    lookup = {}
+    fechas_solicitadas = sorted(set(fechas_necesarias))
+
+    idx = 0  # puntero a fechas disponibles
+    last_known = fx_dict[fechas_disponibles[0]]
+
+    for fecha_req in fechas_solicitadas:
+        # Avanzar puntero hasta encontrar fecha <= fecha_req
+        while idx < len(fechas_disponibles) and fechas_disponibles[idx] <= fecha_req:
+            last_known = fx_dict[fechas_disponibles[idx]]
+            idx += 1
+        lookup[fecha_req] = last_known
+    return lookup
+
+
+def aplicar_conversion_usd(acumulado, fx_lookup):
+    """Aplica conversión MXN→USD a todos los registros de acumulado.
+
+    Modifica `acumulado` in-place dividiendo PML, PML_ENE, PML_PER, PML_CNG
+    entre el tipo de cambio del día. Retorna el acumulado modificado.
+    """
+    if not fx_lookup:
+        return acumulado
+
+    for nodo, filas in acumulado.items():
+        for f in filas:
+            fecha = f.get("fecha", "")
+            tc = fx_lookup.get(fecha)
+            if not tc or tc <= 0:
+                continue
+            for k in ("pml", "pml_ene", "pml_per", "pml_cng"):
+                v = f.get(k)
+                if isinstance(v, (int, float)):
+                    f[k] = round(v / tc, 4)
+    return acumulado
+
+
+def obtener_token_banxico():
+    """Lee el token de Streamlit secrets. Retorna '' si no existe."""
+    try:
+        return st.secrets.get("BANXICO_TOKEN", "")
+    except Exception:
+        return ""
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -645,10 +786,13 @@ def descargar_pml(nodos, fecha_ini, fecha_fin, sistema, proceso, progress_cb=Non
 # ═══════════════════════════════════════════════════════════════════════
 # EXCEL DATOS (datos crudos)
 # ═══════════════════════════════════════════════════════════════════════
-def generar_excel_datos(acumulado, sistema, proceso, fecha_ini, fecha_fin):
+def generar_excel_datos(acumulado, sistema, proceso, fecha_ini, fecha_fin,
+                          moneda="MXN", tc_info=None):
     _NOW = datetime.now().strftime("%Y-%m-%d %H:%M")
     _side = Side(style="thin", color="BFBFBF")
     BORDE = Border(left=_side, right=_side, top=_side, bottom=_side)
+
+    _sym = "USD$" if moneda == "USD" else "$"
 
     def hdr(cell, bg=C_HEADER, fg=C_WHITE, size=11):
         cell.font = Font(bold=True, color=fg, size=size, name="Arial")
@@ -661,8 +805,8 @@ def generar_excel_datos(acumulado, sistema, proceso, fecha_ini, fecha_fin):
     _ALIGN_TXT = Alignment(horizontal="left", vertical="center")
     _FILL_ALT  = PatternFill("solid", start_color=C_ALT)
 
-    COLS   = ["Fecha", "Hora", "PML ($/MWh)", "Energía", "Pérdidas", "Congestión"]
-    ANCHOS = [14, 8, 16, 16, 16, 18]
+    COLS   = ["Fecha", "Hora", f"PML ({_sym}/MWh)", "Energía", "Pérdidas", "Congestión"]
+    ANCHOS = [14, 8, 18, 16, 16, 18]
     ES_NUM = [False, True, True, True, True, True]
 
     wb = Workbook()
@@ -699,6 +843,7 @@ def generar_excel_datos(acumulado, sistema, proceso, fecha_ini, fecha_fin):
         ("Fecha inicial", fecha_ini), ("Fecha final", fecha_fin),
         ("Nodos en reporte", f"{len(acumulado):,} nodos"),
         ("Total registros", f"{sum(len(f) for f in acumulado.values()):,} filas"),
+        ("Moneda", f"{moneda}" + (f" · TC FIX promedio: {tc_info['tc_promedio']:.4f}" if tc_info and tc_info.get('tc_promedio') else "")),
         ("Fecha generación", _NOW),
     ]
     for ri, (lbl, val) in enumerate(info_rows, start=8):
@@ -821,11 +966,14 @@ def generar_excel_datos(acumulado, sistema, proceso, fecha_ini, fecha_fin):
 # ═══════════════════════════════════════════════════════════════════════
 # EXCEL ANÁLISIS (BESS Scoring + métricas)
 # ═══════════════════════════════════════════════════════════════════════
-def generar_excel_analisis(df_metricas, df_resumen, sistema, proceso, fecha_ini, fecha_fin):
+def generar_excel_analisis(df_metricas, df_resumen, sistema, proceso, fecha_ini, fecha_fin,
+                             moneda="MXN", tc_info=None):
     """Excel con BESS scoring para los 3 casos de uso + métricas."""
     _NOW = datetime.now().strftime("%Y-%m-%d %H:%M")
     _side = Side(style="thin", color="BFBFBF")
     BORDE = Border(left=_side, right=_side, top=_side, bottom=_side)
+
+    _sym = "USD$" if moneda == "USD" else "$"
 
     def hdr(cell, bg=C_HEADER, fg=C_WHITE, size=11):
         cell.font = Font(bold=True, color=fg, size=size, name="Arial")
@@ -873,6 +1021,7 @@ def generar_excel_analisis(df_metricas, df_resumen, sistema, proceso, fecha_ini,
         ("Nodos analizados", f"{len(df_metricas)} nodos"),
         ("Casos de uso", "Arbitraje · SSAA · Renewables Firming"),
         ("Metodología scoring", "Rank-percentile (0=peor, 100=mejor)"),
+        ("Moneda", f"{moneda}" + (f" · TC FIX promedio: {tc_info['tc_promedio']:.4f}" if tc_info and tc_info.get('tc_promedio') else "")),
         ("Fecha generación", _NOW),
     ]
     for ri, (lbl, val) in enumerate(info_rows, start=8):
@@ -1298,7 +1447,7 @@ def grafica_lineas_tiempo(df, max_nodos=15):
         ),
         margin=dict(l=70, r=200, t=70, b=60),
     )
-    return _ejes_estandar(fig, "Fecha", "PML promedio diario ($/MWh)")
+    return _ejes_estandar(fig, "Fecha", f"PML promedio diario {label_moneda()}")
 
 
 def grafica_heatmap_horario(df, nodo_seleccionado):
@@ -1320,11 +1469,13 @@ def grafica_heatmap_horario(df, nodo_seleccionado):
         colorscale=colorscale,
         zmid=pivot.values.mean() if pivot.size > 0 else 0,
         colorbar=dict(
-            title=dict(text="$/MWh", font=dict(color=TEXT_DARK, size=12)),
+            title=dict(text=f"{label_moneda_short()}/MWh",
+                       font=dict(color=TEXT_DARK, size=12)),
             thickness=15, len=0.85,
             tickfont=dict(color=TEXT_DARK, size=11),
         ),
-        hovertemplate="<b>Hora:</b> %{y}h<br><b>Mes:</b> %{x}<br><b>PML:</b> $%{z}<extra></extra>",
+        hovertemplate=(f"<b>Hora:</b> %{{y}}h<br><b>Mes:</b> %{{x}}<br>"
+                       f"<b>PML:</b> {label_moneda_short()}%{{z}}<extra></extra>"),
         text=pivot.values,
         texttemplate="%{text:.0f}",
         textfont=dict(size=10, color=TEXT_DARK, family="Arial Black"),
@@ -1369,7 +1520,7 @@ def grafica_barras_top(df, metrica="promedio", top_n=10):
     ))
     fig.update_layout(**_layout_estandar(titulo, height=440))
     fig.update_layout(yaxis=dict(autorange="reversed"))
-    x_title = metrica.capitalize() + " ($/MWh)" if metrica != "negativos" else "% de horas"
+    x_title = metrica.capitalize() + f" {label_moneda()}" if metrica != "negativos" else "% de horas"
     return _ejes_estandar(fig, x_title, "")
 
 
@@ -1540,9 +1691,9 @@ def grafica_mapa(matches_df, df_pml=None, color_by='pml'):
                 f"<b>Estado:</b> {r['estado']}<br>"
                 f"<b>Municipio:</b> {r['municipio']}<br>"
                 f"━━━━━━━━━━━<br>"
-                f"<b>PML promedio:</b> ${r['pml_avg']:.2f}<br>"
-                f"<b>PML máx:</b> ${r['pml_max']:.2f}<br>"
-                f"<b>PML mín:</b> ${r['pml_min']:.2f}<br>"
+                f"<b>PML promedio:</b> {label_moneda_short()}{r['pml_avg']:.2f}<br>"
+                f"<b>PML máx:</b> {label_moneda_short()}{r['pml_max']:.2f}<br>"
+                f"<b>PML mín:</b> {label_moneda_short()}{r['pml_min']:.2f}<br>"
                 f"━━━━━━━━━━━<br>"
                 f"<b>Match:</b> {r['calidad']} (sim {r['similitud']})<br>"
                 f"<b>OSM:</b> {r['nombre_osm']}"
@@ -1556,7 +1707,7 @@ def grafica_mapa(matches_df, df_pml=None, color_by='pml'):
             [0.75, "#f57f17"], [1.0, "#a0090c"],
         ]
         colorbar = dict(
-            title=dict(text="<b>PML promedio<br>($/MWh)</b>",
+            title=dict(text=f"<b>PML promedio<br>{label_moneda()}</b>",
                        font=dict(family="Arial", size=12, color=TEXT_DARK)),
             thickness=18, len=0.7, x=1.02,
             tickfont=dict(family="Arial", size=11, color=TEXT_DARK),
@@ -1720,9 +1871,9 @@ def render_panel_ccr(matches_df, df_pml=None):
             column_config={
                 "ccr":          st.column_config.TextColumn("CCR", width="medium"),
                 "nodos":        st.column_config.NumberColumn("# Nodos", format="%d"),
-                "pml_promedio": st.column_config.NumberColumn("PML promedio", format="$%.2f"),
-                "pml_max":      st.column_config.NumberColumn("Nodo más caro", format="$%.2f"),
-                "pml_min":      st.column_config.NumberColumn("Nodo más barato", format="$%.2f"),
+                "pml_promedio": st.column_config.NumberColumn(f"PML promedio", format=fmt_moneda()),
+                "pml_max":      st.column_config.NumberColumn("Nodo más caro", format=fmt_moneda()),
+                "pml_min":      st.column_config.NumberColumn("Nodo más barato", format=fmt_moneda()),
             },
         )
     else:
@@ -1786,14 +1937,15 @@ def render_bess_scoring(df, use_case_default='Arbitraje'):
     top3 = df_score.head(3)
     cols_t = st.columns(3)
     medals = ['🥇', '🥈', '🥉']
+    sym = label_moneda_short()
     for i, (idx, row) in enumerate(top3.iterrows()):
         with cols_t[i]:
             st.metric(
                 f"{medals[i]} {row['nodo']}",
                 f"{row['score']:.1f}",
-                help=(f"PML promedio: ${row['pml_promedio']:.2f} | "
-                      f"Volatilidad: ${row['volatilidad']:.2f} | "
-                      f"Spread P95-P5: ${row['spread_p95_p5']:.2f}")
+                help=(f"PML promedio: {sym}{row['pml_promedio']:.2f} | "
+                      f"Volatilidad: {sym}{row['volatilidad']:.2f} | "
+                      f"Spread P95-P5: {sym}{row['spread_p95_p5']:.2f}")
             )
 
     fig_rank = grafica_bess_ranking(df_score, use_case, top_n=min(15, len(df_score)))
@@ -1805,11 +1957,11 @@ def render_bess_scoring(df, use_case_default='Arbitraje'):
         column_config={
             "nodo":           st.column_config.TextColumn("Clave", width="small"),
             "score":          st.column_config.NumberColumn("Score BESS", format="%.1f"),
-            "pml_promedio":   st.column_config.NumberColumn("PML promedio", format="$%.2f"),
-            "volatilidad":    st.column_config.NumberColumn("Volatilidad", format="$%.2f"),
-            "spread_p95_p5":  st.column_config.NumberColumn("Spread P95-P5", format="$%.2f"),
-            "spread_avg_diario": st.column_config.NumberColumn("Spread día prom", format="$%.2f"),
-            "spread_dia":     st.column_config.NumberColumn("Spread día/noche", format="$%.2f"),
+            "pml_promedio":   st.column_config.NumberColumn("PML promedio", format=fmt_moneda()),
+            "volatilidad":    st.column_config.NumberColumn("Volatilidad", format=fmt_moneda()),
+            "spread_p95_p5":  st.column_config.NumberColumn("Spread P95-P5", format=fmt_moneda()),
+            "spread_avg_diario": st.column_config.NumberColumn("Spread día prom", format=fmt_moneda()),
+            "spread_dia":     st.column_config.NumberColumn("Spread día/noche", format=fmt_moneda()),
             "cambios_bruscos": st.column_config.NumberColumn("Cambios bruscos", format="%d"),
             "horas_pico":     st.column_config.NumberColumn("Horas pico", format="%d"),
             "pct_horas_neg":  st.column_config.NumberColumn("% horas neg", format="%.1f%%"),
@@ -1835,8 +1987,9 @@ def render_dashboard(acumulado, catalogo, matches_df=None):
     pml_max = df["pml"].max()
     pct_neg = (df["pml"] < 0).sum() / len(df) * 100
     nodo_top = df.groupby("nodo")["pml"].mean().idxmax()
-    col1.metric("PML promedio global", f"${pml_global:.2f}")
-    col2.metric("PML máximo", f"${pml_max:.2f}")
+    sym = label_moneda_short()
+    col1.metric("PML promedio global", f"{sym}{pml_global:.2f}")
+    col2.metric("PML máximo", f"{sym}{pml_max:.2f}")
     col3.metric("% horas negativas", f"{pct_neg:.1f}%")
     col4.metric("Nodo top", nodo_top)
 
@@ -1884,13 +2037,13 @@ def render_dashboard(acumulado, catalogo, matches_df=None):
                 "nombre":      st.column_config.TextColumn("Nombre", width="medium"),
                 "ccr":         st.column_config.TextColumn("CCR", width="small"),
                 "registros":   st.column_config.NumberColumn("# Reg", format="%d"),
-                "promedio":    st.column_config.NumberColumn("Promedio", format="$%.2f"),
-                "mediana":     st.column_config.NumberColumn("Mediana", format="$%.2f"),
-                "maximo":      st.column_config.NumberColumn("Máximo", format="$%.2f"),
-                "minimo":      st.column_config.NumberColumn("Mínimo", format="$%.2f"),
-                "std":         st.column_config.NumberColumn("Volatilidad", format="$%.2f"),
-                "p95":         st.column_config.NumberColumn("P95", format="$%.2f"),
-                "p5":          st.column_config.NumberColumn("P5", format="$%.2f"),
+                "promedio":    st.column_config.NumberColumn("Promedio", format=fmt_moneda()),
+                "mediana":     st.column_config.NumberColumn("Mediana", format=fmt_moneda()),
+                "maximo":      st.column_config.NumberColumn("Máximo", format=fmt_moneda()),
+                "minimo":      st.column_config.NumberColumn("Mínimo", format=fmt_moneda()),
+                "std":         st.column_config.NumberColumn("Volatilidad", format=fmt_moneda()),
+                "p95":         st.column_config.NumberColumn("P95", format=fmt_moneda()),
+                "p5":          st.column_config.NumberColumn("P5", format=fmt_moneda()),
                 "% horas neg": st.column_config.NumberColumn("% Neg", format="%.1f%%"),
             },
         )
@@ -1925,39 +2078,44 @@ def render_dashboard(acumulado, catalogo, matches_df=None):
 # RENDER CENTRO DE DESCARGAS (Modo Solo Datos)
 # ═══════════════════════════════════════════════════════════════════════
 def render_centro_descargas(acumulado, catalogo, sistema, proceso, fecha_ini, fecha_fin,
-                              matches_df=None):
+                              matches_df=None, moneda="MXN", tc_info=None):
     st.divider()
     st.markdown("## 📥 Centro de descargas")
-    st.caption("Selecciona los archivos que necesites descargar.")
+    moneda_label = f"💱 Análisis en **{moneda}**"
+    if moneda == "USD" and tc_info and tc_info.get("tc_promedio"):
+        moneda_label += f" · TC FIX promedio: **{tc_info['tc_promedio']:.4f} MXN/USD**"
+    st.caption(f"Selecciona los archivos que necesites descargar. {moneda_label}")
 
     df = acumulado_a_dataframe(acumulado, catalogo)
     df_resumen = calcular_resumen(df) if not df.empty else pd.DataFrame()
     df_metricas = calcular_metricas_bess(df) if not df.empty else pd.DataFrame()
     ts = datetime.now().strftime("%Y%m%d_%H%M")
+    sufijo = f"_{moneda}"
 
     col1, col2, col3 = st.columns(3)
 
     with col1:
         st.markdown("##### 📊 Excel de Datos")
-        st.caption("Datos PML completos: portada + resumen + 1 hoja por nodo con todos los registros horarios.")
+        st.caption(f"Datos PML completos en {moneda}: portada + resumen + 1 hoja por nodo.")
         if "excel_datos_bytes" not in st.session_state:
             st.session_state["excel_datos_bytes"] = None
         if st.button("Generar Excel datos", key="btn_gen_datos", type="primary"):
             with st.spinner("Generando Excel de datos..."):
                 st.session_state["excel_datos_bytes"] = generar_excel_datos(
-                    acumulado, sistema, proceso, fecha_ini, fecha_fin)
+                    acumulado, sistema, proceso, fecha_ini, fecha_fin,
+                    moneda=moneda, tc_info=tc_info)
         if st.session_state["excel_datos_bytes"]:
             st.download_button(
                 label="📥 Descargar",
                 data=st.session_state["excel_datos_bytes"],
-                file_name=f"PML_CENACE_Datos_{sistema}_{ts}.xlsx",
+                file_name=f"PML_CENACE_Datos{sufijo}_{sistema}_{ts}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 key="dl_datos",
             )
 
     with col2:
         st.markdown("##### 📈 Excel de Análisis")
-        st.caption("BESS Scoring para los 3 casos de uso + métricas calculadas + resumen estadístico.")
+        st.caption(f"BESS Scoring 3 casos de uso + métricas en {moneda}.")
         if "excel_analisis_bytes" not in st.session_state:
             st.session_state["excel_analisis_bytes"] = None
         if st.button("Generar Excel análisis", key="btn_gen_anal", type="primary"):
@@ -1966,19 +2124,20 @@ def render_centro_descargas(acumulado, catalogo, sistema, proceso, fecha_ini, fe
             else:
                 with st.spinner("Generando Excel de análisis..."):
                     st.session_state["excel_analisis_bytes"] = generar_excel_analisis(
-                        df_metricas, df_resumen, sistema, proceso, fecha_ini, fecha_fin)
+                        df_metricas, df_resumen, sistema, proceso, fecha_ini, fecha_fin,
+                        moneda=moneda, tc_info=tc_info)
         if st.session_state["excel_analisis_bytes"]:
             st.download_button(
                 label="📥 Descargar",
                 data=st.session_state["excel_analisis_bytes"],
-                file_name=f"PML_CENACE_Analisis_BESS_{sistema}_{ts}.xlsx",
+                file_name=f"PML_CENACE_Analisis_BESS{sufijo}_{sistema}_{ts}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 key="dl_anal",
             )
 
     with col3:
         st.markdown("##### 🌍 KMZ Geográfico")
-        st.caption("Ubicación de los nodos en Google Earth Pro. Requiere geocodificación.")
+        st.caption("Ubicación de los nodos en Google Earth Pro.")
         if matches_df is None or matches_df.empty:
             st.info("⚠️ La geocodificación no se hizo. Activa el toggle '🗺️ Incluir geocodificación' en el sidebar y vuelve a ejecutar.")
         else:
@@ -2009,7 +2168,7 @@ st.markdown(f"""
     <h1>⚡ CENACE PML Analyzer 
         <span class="srf-badge">SRF</span>
     </h1>
-    <p>Descarga, análisis, mapeo y BESS scoring — Recurrent Energy / Canadian Solar</p>
+    <p>Descarga, análisis, mapeo y BESS scoring · MXN o USD (Banxico FIX) — Recurrent Energy / Canadian Solar</p>
 </div>
 """, unsafe_allow_html=True)
 
@@ -2051,6 +2210,25 @@ with st.sidebar:
     es_completo = (modo == "🚀 Completo")
     necesita_datos = es_solo_datos or es_completo
     necesita_mapa = es_solo_mapa or es_completo
+
+    # Selector de moneda — solo si se usan datos
+    if necesita_datos:
+        st.markdown("---")
+        st.markdown("**💱 Moneda del análisis**")
+        moneda_sel = st.radio(
+            "Moneda:",
+            options=["🇲🇽 MXN (pesos)", "🇺🇸 USD (dólares)"],
+            index=0,
+            label_visibility="collapsed",
+            help=(
+                "**MXN**: PML directo del CENACE en pesos.\n\n"
+                "**USD**: convertido día por día con el tipo de cambio "
+                "FIX de Banxico (serie SF43718)."
+            ),
+        )
+        st.session_state["moneda"] = "USD" if "USD" in moneda_sel else "MXN"
+    else:
+        st.session_state["moneda"] = "MXN"
 
     st.markdown("---")
     st.markdown("**📍 Nodos CENACE**")
@@ -2184,6 +2362,9 @@ if boton and nodos:
     try:
         acumulado = {}
         errores = []
+        fx_info = {"moneda": "MXN", "tc_promedio": None, "tc_lookup": {},
+                   "fuente": "N/A", "advertencia": ""}
+
         if necesita_datos:
             if f_ini >= f_fin:
                 st.error("❌ La fecha inicial debe ser anterior a la final.")
@@ -2204,6 +2385,62 @@ if boton and nodos:
                 st.error("❌ No se recibieron datos PML.")
                 st.stop()
 
+            # ─── CONVERSIÓN A USD si aplica ───
+            moneda_seleccionada = st.session_state.get("moneda", "MXN")
+            if moneda_seleccionada == "USD":
+                token = obtener_token_banxico()
+                if not token:
+                    st.warning(
+                        "⚠️ No se encontró el token de Banxico en los secrets de Streamlit. "
+                        "El análisis se mostrará en MXN. Para usar USD, agrega "
+                        "`BANXICO_TOKEN` en Settings → Secrets de tu app."
+                    )
+                    st.session_state["moneda"] = "MXN"
+                    fx_info["advertencia"] = "Sin token Banxico — análisis en MXN."
+                else:
+                    # Descargar serie FIX para el período (con buffer de 5 días para fin de semana)
+                    f_ini_buffer = (f_ini - timedelta(days=5)).strftime("%Y-%m-%d")
+                    f_fin_buffer = f_fin.strftime("%Y-%m-%d")
+
+                    with st.spinner("📥 Descargando tipo de cambio FIX de Banxico..."):
+                        fx_dict = cargar_fx_banxico(f_ini_buffer, f_fin_buffer, token)
+
+                    if not fx_dict:
+                        st.warning(
+                            "⚠️ No se pudo obtener el tipo de cambio de Banxico. "
+                            "El análisis se mostrará en MXN."
+                        )
+                        st.session_state["moneda"] = "MXN"
+                        fx_info["advertencia"] = "Banxico no respondió — análisis en MXN."
+                    else:
+                        # Construir lookup completo (incluye fines de semana)
+                        fechas_unicas = set()
+                        for nodo, filas in acumulado.items():
+                            for f in filas:
+                                fechas_unicas.add(f.get("fecha", ""))
+                        fx_lookup = construir_fx_lookup(fx_dict, fechas_unicas)
+
+                        # Aplicar conversión
+                        acumulado = aplicar_conversion_usd(acumulado, fx_lookup)
+
+                        # Guardar info
+                        if fx_lookup:
+                            tcs = list(fx_lookup.values())
+                            fx_info = {
+                                "moneda": "USD",
+                                "tc_promedio": sum(tcs)/len(tcs) if tcs else None,
+                                "tc_min": min(tcs) if tcs else None,
+                                "tc_max": max(tcs) if tcs else None,
+                                "tc_lookup": fx_lookup,
+                                "fuente": "Banxico FIX (SF43718)",
+                                "advertencia": "",
+                            }
+                            st.success(
+                                f"💱 Análisis convertido a USD. TC FIX promedio del período: "
+                                f"**{fx_info['tc_promedio']:.4f} MXN/USD** "
+                                f"(rango: {fx_info['tc_min']:.4f} – {fx_info['tc_max']:.4f})"
+                            )
+
         # Geocodificación si necesita mapa O si en solo datos pidió geo
         matches_df = None
         if necesita_mapa or (es_solo_datos and incluir_geo_solo_datos):
@@ -2219,11 +2456,13 @@ if boton and nodos:
         st.session_state["consulta_ejecutada"] = True
         st.session_state["acumulado"] = acumulado
         st.session_state["matches_df"] = matches_df
+        st.session_state["fx_info"] = fx_info
         st.session_state["consulta_params"] = {
             "sistema": sistema, "proceso": proceso,
             "fecha_ini": fecha_ini, "fecha_fin": fecha_fin,
             "modo": modo, "errores": errores,
             "tiempo": time.time() - t0,
+            "moneda_aplicada": st.session_state.get("moneda", "MXN"),
         }
 
     except Exception as e:
@@ -2240,7 +2479,20 @@ if st.session_state.get("consulta_ejecutada"):
     acumulado = st.session_state["acumulado"]
     matches_df = st.session_state["matches_df"]
     params = st.session_state["consulta_params"]
+    fx_info = st.session_state.get("fx_info", {"moneda": "MXN"})
     modo_cur = params.get("modo", modo)
+
+    # Asegurar que la moneda mostrada coincida con la de la consulta ya hecha
+    moneda_aplicada = params.get("moneda_aplicada", "MXN")
+    st.session_state["moneda"] = moneda_aplicada
+
+    # Banner FX si está en USD
+    if moneda_aplicada == "USD" and fx_info.get("tc_promedio"):
+        st.info(
+            f"💱 **Análisis en USD** · "
+            f"TC promedio del período: **{fx_info['tc_promedio']:.4f} MXN/USD** · "
+            f"Fuente: {fx_info['fuente']}"
+        )
 
     if necesita_datos and acumulado:
         n_total = sum(len(f) for f in acumulado.values())
@@ -2288,6 +2540,8 @@ if st.session_state.get("consulta_ejecutada"):
                 params["sistema"], params["proceso"],
                 params["fecha_ini"], params["fecha_fin"],
                 matches_df=matches_df,
+                moneda=moneda_aplicada,
+                tc_info=fx_info,
             )
 
     else:
