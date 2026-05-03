@@ -3469,6 +3469,8 @@ if boton and nodos:
     try:
         acumulado = {}
         errores = []
+        info_sistemas = {}
+        nodos_sin_sis = []
         fx_info = {"moneda": "MXN", "tc_promedio": None, "tc_lookup": {},
                    "fuente": "N/A", "advertencia": ""}
 
