@@ -1,13 +1,16 @@
 """
-CENACE PML Analyzer — Streamlit Cloud Edition  v4
+CENACE PML Analyzer — Streamlit Cloud Edition  v5
 ======================================================
 Recurrent Energy / Canadian Solar — SRF · Sebastian Roldan
 
-v4 changes vs v3:
-- Labels y títulos negros para mejor legibilidad
-- Marcadores de mapa más grandes con borde blanco (pin-style)
-- 3 modos de uso: Solo mapa / Solo datos / Completo
-- BESS Scoring por caso de uso (Arbitraje / SSAA / Renewables Firming)
+v5 changes vs v4:
+- Estado persistente con st.session_state (no se reinicia al cambiar scoring)
+- Modo Completo: solo dashboard analítico (sin Excel)
+- Modo Solo Datos: Centro de descargas con Excel datos + Excel análisis + KMZ opcional
+- Workers fijo en 8 (sin slider)
+- Optimizaciones de memoria y caching
+- Leyenda de CCR en el mapa
+- BESS scoring también descargable como Excel
 """
 
 import streamlit as st
@@ -46,33 +49,36 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+# Workers fijo (no más slider)
+MAX_WORKERS = 8
+
 # ═══════════════════════════════════════════════════════════════════════
-# COLORES — todos los textos en oscuro/negro para legibilidad
+# COLORES
 # ═══════════════════════════════════════════════════════════════════════
 RE_NAVY     = "#0e346b"
 RE_RED      = "#a0090c"
 RE_BLUE     = "#2777bd"
 RE_ALT      = "#EBF3FB"
 RE_INFO     = "#D9E2F3"
-TEXT_DARK   = "#1a1a1a"   # Negro casi puro para todos los labels
-TEXT_TITLE  = "#0a2347"   # Navy más oscuro para títulos
-GRID_LIGHT  = "#D8D8D8"   # Más visible que antes
-AXIS_LINE   = "#444444"   # Ejes más oscuros
+TEXT_DARK   = "#1a1a1a"
+TEXT_TITLE  = "#0a2347"
+GRID_LIGHT  = "#D8D8D8"
+AXIS_LINE   = "#444444"
 
-# Paleta alta visibilidad
 PALETTE = [
     "#0e346b", "#a0090c", "#d4a017", "#1a8a3a", "#7e57c2",
     "#ff5722", "#00897b", "#c2185b", "#3949ab", "#5d4037",
     "#1976d2", "#558b2f", "#f57c00", "#8e24aa", "#455a64",
 ]
 
-# Colores para openpyxl
 C_HEADER = "0e346b"
 C_SUB    = "2777bd"
 C_RED    = "a0090c"
 C_WHITE  = "FFFFFF"
 C_ALT    = "EBF3FB"
 C_INFO   = "D9E2F3"
+C_GREEN  = "1a8a3a"
+C_GOLD   = "d4a017"
 
 st.markdown(f"""
 <style>
@@ -96,11 +102,26 @@ st.markdown(f"""
         padding: 0.6rem 1rem; border-radius: 4px; margin-bottom: 1rem;
         color: {TEXT_DARK}; font-size: 0.9rem;
     }}
+    .ccr-legend {{
+        background: white; border: 1px solid #d0d0d0;
+        border-radius: 6px; padding: 0.8rem 1rem;
+        margin-top: 0.5rem;
+    }}
+    .ccr-legend-item {{
+        display: inline-block; margin: 0.2rem 0.6rem 0.2rem 0;
+        font-size: 0.88rem; color: {TEXT_DARK};
+    }}
+    .ccr-dot {{
+        display: inline-block; width: 12px; height: 12px;
+        border-radius: 50%; margin-right: 5px;
+        border: 1px solid {TEXT_DARK};
+        vertical-align: middle;
+    }}
 </style>
 """, unsafe_allow_html=True)
 
 # ═══════════════════════════════════════════════════════════════════════
-# CONSTANTES
+# CONSTANTES API
 # ═══════════════════════════════════════════════════════════════════════
 BASE_URL    = "https://ws01.cenace.gob.mx:8082/SWPML/SIM"
 BLOQUE_MAX  = 7
@@ -116,7 +137,7 @@ OSM_HEADERS = {
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# CARGAR CATÁLOGO
+# CARGAR CATÁLOGO (cached)
 # ═══════════════════════════════════════════════════════════════════════
 @st.cache_data
 def cargar_catalogo():
@@ -145,7 +166,7 @@ def cargar_catalogo():
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# OSM
+# OSM CACHE
 # ═══════════════════════════════════════════════════════════════════════
 @st.cache_data(show_spinner=False, ttl=86400 * 7)
 def cargar_osm_subestaciones():
@@ -530,7 +551,7 @@ def consultar(nodos_lista, fecha_ini, fecha_fin, sistema, proceso,
         with lock:
             errores_lista.append({"fecha": f"{fecha_ini} → {fecha_fin}",
                                    "nodos": len(nodos_lista),
-                                   "error": f"URL muy larga"})
+                                   "error": "URL muy larga"})
         return None
     session = requests.Session(); session.verify = False
     for intento in range(max_reintentos):
@@ -592,8 +613,7 @@ def parsear_json(texto):
         datos[clv] = registros
     return datos
 
-def descargar_pml(nodos, fecha_ini, fecha_fin, sistema, proceso,
-                  max_workers=8, progress_cb=None):
+def descargar_pml(nodos, fecha_ini, fecha_fin, sistema, proceso, progress_cb=None):
     bloques = generar_bloques(fecha_ini, fecha_fin)
     LOTE = 10
     lotes_nodos = [nodos[i:i+LOTE] for i in range(0, len(nodos), LOTE)]
@@ -608,7 +628,7 @@ def descargar_pml(nodos, fecha_ini, fecha_fin, sistema, proceso,
         lote, bi, bf = c
         return parsear_json(consultar(lote, bi, bf, sistema, proceso,
                                        errores_consulta, lock))
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = {executor.submit(_job, c): c for c in consultas}
         for fut in as_completed(futures):
             data = fut.result() or {}
@@ -623,7 +643,7 @@ def descargar_pml(nodos, fecha_ini, fecha_fin, sistema, proceso,
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# EXCEL DATOS
+# EXCEL DATOS (datos crudos)
 # ═══════════════════════════════════════════════════════════════════════
 def generar_excel_datos(acumulado, sistema, proceso, fecha_ini, fecha_fin):
     _NOW = datetime.now().strftime("%Y-%m-%d %H:%M")
@@ -661,7 +681,7 @@ def generar_excel_datos(acumulado, sistema, proceso, fecha_ini, fecha_fin):
         ws.row_dimensions[r].height = 32
 
     ws.merge_cells("B5:H5")
-    c = ws["B5"]; c.value = "Reporte de Datos — Análisis BESS"
+    c = ws["B5"]; c.value = "Reporte de Datos"
     c.font = Font(bold=True, italic=True, color=C_WHITE, size=12, name="Arial")
     c.fill = PatternFill("solid", start_color=C_RED)
     c.alignment = Alignment(horizontal="center", vertical="center")
@@ -799,6 +819,273 @@ def generar_excel_datos(acumulado, sistema, proceso, fecha_ini, fecha_fin):
 
 
 # ═══════════════════════════════════════════════════════════════════════
+# EXCEL ANÁLISIS (BESS Scoring + métricas)
+# ═══════════════════════════════════════════════════════════════════════
+def generar_excel_analisis(df_metricas, df_resumen, sistema, proceso, fecha_ini, fecha_fin):
+    """Excel con BESS scoring para los 3 casos de uso + métricas."""
+    _NOW = datetime.now().strftime("%Y-%m-%d %H:%M")
+    _side = Side(style="thin", color="BFBFBF")
+    BORDE = Border(left=_side, right=_side, top=_side, bottom=_side)
+
+    def hdr(cell, bg=C_HEADER, fg=C_WHITE, size=11):
+        cell.font = Font(bold=True, color=fg, size=size, name="Arial")
+        cell.fill = PatternFill("solid", start_color=bg)
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        cell.border = BORDE
+
+    _FONT_DATO = Font(name="Arial", size=10)
+    _ALIGN_NUM = Alignment(horizontal="center", vertical="center")
+    _ALIGN_TXT = Alignment(horizontal="left", vertical="center")
+    _FILL_ALT  = PatternFill("solid", start_color=C_ALT)
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "■ Portada"
+    ws.sheet_properties.tabColor = C_RED
+    ws.sheet_view.showGridLines = False
+
+    ws.merge_cells("B2:H4")
+    c = ws["B2"]
+    c.value = "Análisis BESS — PML CENACE\nScoring por caso de uso"
+    c.font = Font(bold=True, color=C_WHITE, size=22, name="Arial")
+    c.fill = PatternFill("solid", start_color=C_HEADER)
+    c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    for r in range(2, 5):
+        ws.row_dimensions[r].height = 32
+
+    ws.merge_cells("B5:H5")
+    c = ws["B5"]; c.value = "Reporte de Análisis — Battery Energy Storage System"
+    c.font = Font(bold=True, italic=True, color=C_WHITE, size=12, name="Arial")
+    c.fill = PatternFill("solid", start_color=C_RED)
+    c.alignment = Alignment(horizontal="center", vertical="center")
+    ws.row_dimensions[5].height = 24
+
+    ws.merge_cells("B7:H7")
+    c = ws["B7"]; c.value = "PARÁMETROS"
+    c.font = Font(bold=True, color=C_WHITE, size=12, name="Arial")
+    c.fill = PatternFill("solid", start_color=C_SUB)
+    c.alignment = Alignment(horizontal="center", vertical="center")
+    ws.row_dimensions[7].height = 22
+
+    info_rows = [
+        ("Sistema", sistema), ("Proceso", proceso),
+        ("Período", f"{fecha_ini} → {fecha_fin}"),
+        ("Nodos analizados", f"{len(df_metricas)} nodos"),
+        ("Casos de uso", "Arbitraje · SSAA · Renewables Firming"),
+        ("Metodología scoring", "Rank-percentile (0=peor, 100=mejor)"),
+        ("Fecha generación", _NOW),
+    ]
+    for ri, (lbl, val) in enumerate(info_rows, start=8):
+        ws.merge_cells(f"B{ri}:D{ri}")
+        c1 = ws[f"B{ri}"]; c1.value = lbl
+        c1.font = Font(bold=True, color=C_HEADER, size=11, name="Arial")
+        c1.fill = PatternFill("solid", start_color=C_INFO)
+        c1.alignment = Alignment(horizontal="left", vertical="center", indent=1)
+        c1.border = BORDE
+        ws.merge_cells(f"E{ri}:H{ri}")
+        c2 = ws[f"E{ri}"]; c2.value = val
+        c2.font = Font(size=11, name="Arial")
+        c2.alignment = Alignment(horizontal="left", vertical="center", indent=1)
+        c2.border = BORDE
+        ws.row_dimensions[ri].height = 22
+
+    ws.merge_cells("B17:H19")
+    c = ws["B17"]; c.value = "SRF"
+    c.font = Font(bold=True, color=C_HEADER, size=72, name="Arial")
+    c.alignment = Alignment(horizontal="center", vertical="center")
+    for r in range(17, 20):
+        ws.row_dimensions[r].height = 30
+
+    ws.merge_cells("B21:H21")
+    c = ws["B21"]; c.value = "Prepared by: Sebastian Roldan · Recurrent Energy"
+    c.font = Font(italic=True, bold=True, color=C_HEADER, size=12, name="Arial")
+    c.alignment = Alignment(horizontal="center", vertical="center")
+    c.fill = PatternFill("solid", start_color=C_INFO)
+    ws.row_dimensions[21].height = 22
+
+    ws.merge_cells("B22:H22")
+    c = ws["B22"]; c.value = "A subsidiary of Canadian Solar"
+    c.font = Font(italic=True, color="555555", size=10, name="Arial")
+    c.alignment = Alignment(horizontal="center", vertical="center")
+    ws.row_dimensions[22].height = 18
+
+    for col, w in [("A", 3), ("B", 16), ("C", 16), ("D", 16),
+                   ("E", 16), ("F", 16), ("G", 16), ("H", 16), ("I", 3)]:
+        ws.column_dimensions[col].width = w
+
+    # Hoja Top 5 por caso de uso
+    ws_top = wb.create_sheet("🏆 Top 5 por Caso de Uso")
+    ws_top.merge_cells("A1:F1")
+    c = ws_top["A1"]; c.value = "Top 5 nodos recomendados por caso de uso BESS"
+    c.font = Font(bold=True, color=C_WHITE, size=14, name="Arial")
+    c.fill = PatternFill("solid", start_color=C_HEADER)
+    c.alignment = Alignment(horizontal="center", vertical="center")
+    ws_top.row_dimensions[1].height = 28
+
+    cur_row = 3
+    for use_case in ['Arbitraje', 'Servicios Auxiliares', 'Renewables Firming']:
+        df_score = calcular_score_bess(df_metricas, use_case)
+        if df_score.empty: continue
+
+        # Header del caso
+        ws_top.merge_cells(f"A{cur_row}:F{cur_row}")
+        c = ws_top.cell(row=cur_row, column=1)
+        c.value = f"⚡ {use_case}"
+        c.font = Font(bold=True, color=C_WHITE, size=12, name="Arial")
+        c.fill = PatternFill("solid", start_color=C_RED)
+        c.alignment = Alignment(horizontal="center", vertical="center")
+        ws_top.row_dimensions[cur_row].height = 22
+        cur_row += 1
+
+        # Subheader
+        cols_top = ["Rank", "Nodo", "Score", "PML promedio", "Volatilidad", "Spread P95-P5"]
+        for ci, col in enumerate(cols_top, 1):
+            hdr(ws_top.cell(row=cur_row, column=ci, value=col), bg=C_SUB)
+        ws_top.row_dimensions[cur_row].height = 20
+        cur_row += 1
+
+        for i, (_, r) in enumerate(df_score.head(5).iterrows(), 1):
+            bg = C_ALT if i % 2 == 0 else None
+            medal = ['🥇', '🥈', '🥉', '4', '5'][i-1]
+            valores = [medal, r['nodo'], f"{r['score']:.1f}",
+                       f"${r['pml_promedio']:.2f}",
+                       f"${r['volatilidad']:.2f}",
+                       f"${r['spread_p95_p5']:.2f}"]
+            for ci, v in enumerate(valores, 1):
+                cc = ws_top.cell(row=cur_row, column=ci, value=v)
+                cc.font = _FONT_DATO
+                cc.border = BORDE
+                cc.alignment = _ALIGN_NUM if ci != 2 else _ALIGN_TXT
+                if bg: cc.fill = PatternFill("solid", start_color=bg)
+            cur_row += 1
+        cur_row += 1
+
+    for ci, w in enumerate([8, 16, 14, 16, 16, 18], 1):
+        ws_top.column_dimensions[get_column_letter(ci)].width = w
+    ws_top.freeze_panes = "A2"
+
+    # Hoja BESS scoring completo (3 casos de uso)
+    for use_case in ['Arbitraje', 'Servicios Auxiliares', 'Renewables Firming']:
+        df_score = calcular_score_bess(df_metricas, use_case)
+        if df_score.empty: continue
+
+        sheet_name = f"BESS {use_case[:22]}"
+        ws_bess = wb.create_sheet(title=sheet_name[:31])
+
+        ws_bess.merge_cells("A1:J1")
+        c = ws_bess["A1"]; c.value = f"BESS Scoring — {use_case}"
+        c.font = Font(bold=True, color=C_WHITE, size=13, name="Arial")
+        c.fill = PatternFill("solid", start_color=C_HEADER)
+        c.alignment = Alignment(horizontal="center", vertical="center")
+        ws_bess.row_dimensions[1].height = 26
+
+        ws_bess.merge_cells("A2:J2")
+        c = ws_bess["A2"]
+        c.value = DESCRIPCIONES_USE_CASE_PLAIN.get(use_case, "")
+        c.font = Font(italic=True, size=10, name="Arial", color="555555")
+        c.fill = PatternFill("solid", start_color=C_INFO)
+        c.alignment = Alignment(horizontal="center", vertical="center")
+        ws_bess.row_dimensions[2].height = 20
+
+        cols = ["Rank", "Nodo", "Score (0-100)", "PML promedio",
+                "Volatilidad", "Spread P95-P5", "Spread día prom",
+                "Cambios bruscos", "Horas pico", "% horas neg"]
+        for ci, col in enumerate(cols, 1):
+            hdr(ws_bess.cell(row=3, column=ci, value=col), bg=C_SUB)
+        ws_bess.row_dimensions[3].height = 32
+
+        for i, (_, r) in enumerate(df_score.iterrows(), 1):
+            bg = C_ALT if i % 2 == 0 else None
+            valores = [i, r['nodo'], r['score'], r['pml_promedio'],
+                       r['volatilidad'], r['spread_p95_p5'],
+                       r['spread_avg_diario'], r['cambios_bruscos'],
+                       r['horas_pico'], r['pct_horas_neg']]
+            for ci, v in enumerate(valores, 1):
+                cc = ws_bess.cell(row=i+3, column=ci, value=v)
+                cc.font = _FONT_DATO
+                cc.border = BORDE
+                cc.alignment = _ALIGN_NUM if ci != 2 else _ALIGN_TXT
+                if bg: cc.fill = PatternFill("solid", start_color=bg)
+                if ci in (3, 4, 5, 6, 7): cc.number_format = "#,##0.00"
+                elif ci == 10: cc.number_format = "0.0\"%\""
+
+        for ci, w in enumerate([8, 16, 14, 14, 14, 14, 14, 14, 12, 14], 1):
+            ws_bess.column_dimensions[get_column_letter(ci)].width = w
+        ws_bess.freeze_panes = "A4"
+
+    # Hoja Resumen (estadísticas básicas)
+    ws_res = wb.create_sheet("📊 Resumen Estadístico")
+    ws_res.merge_cells("A1:K1")
+    c = ws_res["A1"]; c.value = f"Resumen estadístico — {len(df_resumen)} nodos"
+    c.font = Font(bold=True, color=C_WHITE, size=14, name="Arial")
+    c.fill = PatternFill("solid", start_color=C_HEADER)
+    c.alignment = Alignment(horizontal="center", vertical="center")
+    ws_res.row_dimensions[1].height = 26
+
+    cols = ["Nodo", "Nombre", "CCR", "# Reg", "Promedio", "Mediana",
+            "Máximo", "Mínimo", "Volatilidad", "P95", "% horas neg"]
+    for ci, col in enumerate(cols, 1):
+        hdr(ws_res.cell(row=2, column=ci, value=col), bg=C_SUB)
+    ws_res.row_dimensions[2].height = 22
+
+    for i, (_, r) in enumerate(df_resumen.iterrows(), 1):
+        bg = C_ALT if i % 2 == 0 else None
+        valores = [r['nodo'], r['nombre'], r['ccr'], r['registros'],
+                   r['promedio'], r['mediana'], r['maximo'], r['minimo'],
+                   r['std'], r['p95'], r['% horas neg']]
+        for ci, v in enumerate(valores, 1):
+            cc = ws_res.cell(row=i+2, column=ci, value=v)
+            cc.font = _FONT_DATO
+            cc.border = BORDE
+            cc.alignment = _ALIGN_NUM if ci > 3 else _ALIGN_TXT
+            if bg: cc.fill = PatternFill("solid", start_color=bg)
+            if ci in (5, 6, 7, 8, 9, 10): cc.number_format = "#,##0.00"
+            elif ci == 11: cc.number_format = "0.0\"%\""
+
+    for ci, w in enumerate([14, 22, 14, 10, 12, 12, 12, 12, 12, 12, 12], 1):
+        ws_res.column_dimensions[get_column_letter(ci)].width = w
+    ws_res.freeze_panes = "A3"
+
+    # Hoja Métricas Raw (todas las métricas calculadas)
+    ws_m = wb.create_sheet("🔢 Métricas Calculadas")
+    ws_m.merge_cells("A1:I1")
+    c = ws_m["A1"]; c.value = "Métricas BESS calculadas (datos raw)"
+    c.font = Font(bold=True, color=C_WHITE, size=14, name="Arial")
+    c.fill = PatternFill("solid", start_color=C_HEADER)
+    c.alignment = Alignment(horizontal="center", vertical="center")
+    ws_m.row_dimensions[1].height = 26
+
+    cols_m = ["Nodo", "PML promedio", "Volatilidad", "Spread P95-P5",
+              "Spread día prom", "Spread día/noche", "Cambios bruscos",
+              "Horas pico", "% horas neg"]
+    for ci, col in enumerate(cols_m, 1):
+        hdr(ws_m.cell(row=2, column=ci, value=col), bg=C_SUB)
+    ws_m.row_dimensions[2].height = 32
+
+    for i, (_, r) in enumerate(df_metricas.iterrows(), 1):
+        bg = C_ALT if i % 2 == 0 else None
+        valores = [r['nodo'], r['pml_promedio'], r['volatilidad'],
+                   r['spread_p95_p5'], r['spread_avg_diario'], r['spread_dia'],
+                   r['cambios_bruscos'], r['horas_pico'], r['pct_horas_neg']]
+        for ci, v in enumerate(valores, 1):
+            cc = ws_m.cell(row=i+2, column=ci, value=v)
+            cc.font = _FONT_DATO
+            cc.border = BORDE
+            cc.alignment = _ALIGN_NUM if ci != 1 else _ALIGN_TXT
+            if bg: cc.fill = PatternFill("solid", start_color=bg)
+            if ci in (2, 3, 4, 5, 6): cc.number_format = "#,##0.00"
+            elif ci == 9: cc.number_format = "0.0\"%\""
+
+    for ci, w in enumerate([14, 14, 14, 14, 14, 14, 14, 12, 12], 1):
+        ws_m.column_dimensions[get_column_letter(ci)].width = w
+    ws_m.freeze_panes = "A3"
+
+    buffer = io.BytesIO()
+    wb.save(buffer); buffer.seek(0)
+    return buffer.getvalue()
+
+
+# ═══════════════════════════════════════════════════════════════════════
 # KMZ
 # ═══════════════════════════════════════════════════════════════════════
 def generar_kmz(matches_df):
@@ -885,12 +1172,14 @@ def generar_kmz(matches_df):
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# DASHBOARD COMPONENTS
+# DATAFRAMES (cached para performance)
 # ═══════════════════════════════════════════════════════════════════════
-def acumulado_a_dataframe(acumulado, catalogo):
+@st.cache_data(show_spinner=False, max_entries=3)
+def acumulado_a_dataframe_cached(acumulado_id, _acumulado, _catalogo):
+    """Convierte acumulado a DF. acumulado_id es un hash para cache key."""
     rows = []
-    for nodo, filas in acumulado.items():
-        info = catalogo.get(nodo, {}) if catalogo else {}
+    for nodo, filas in _acumulado.items():
+        info = _catalogo.get(nodo, {}) if _catalogo else {}
         for f in filas:
             try: pml_val = float(f["pml"])
             except (TypeError, ValueError): continue
@@ -911,9 +1200,20 @@ def acumulado_a_dataframe(acumulado, catalogo):
     return df
 
 
-def calcular_resumen(df):
-    if df.empty: return pd.DataFrame()
-    summary = df.groupby("nodo").agg(
+def acumulado_a_dataframe(acumulado, catalogo):
+    """Wrapper con hash key para cache."""
+    if not acumulado: return pd.DataFrame()
+    # Hash key: # nodos + total filas + primer nodo
+    key = (len(acumulado),
+           sum(len(v) for v in acumulado.values()),
+           list(acumulado.keys())[0] if acumulado else "")
+    return acumulado_a_dataframe_cached(str(key), acumulado, catalogo)
+
+
+@st.cache_data(show_spinner=False, max_entries=3)
+def calcular_resumen_cached(df_hash, _df):
+    if _df.empty: return pd.DataFrame()
+    summary = _df.groupby("nodo").agg(
         nombre=("nombre", "first"),
         ccr=("ccr", "first"),
         registros=("pml", "count"),
@@ -923,16 +1223,22 @@ def calcular_resumen(df):
         minimo=("pml", "min"),
         std=("pml", "std"),
     ).round(2)
-    pct_neg = df.groupby("nodo")["pml"].apply(
+    pct_neg = _df.groupby("nodo")["pml"].apply(
         lambda x: (x < 0).sum() / len(x) * 100 if len(x) > 0 else 0
     ).round(1)
     summary["% horas neg"] = pct_neg
-    summary["p95"] = df.groupby("nodo")["pml"].quantile(0.95).round(2)
-    summary["p5"] = df.groupby("nodo")["pml"].quantile(0.05).round(2)
+    summary["p95"] = _df.groupby("nodo")["pml"].quantile(0.95).round(2)
+    summary["p5"] = _df.groupby("nodo")["pml"].quantile(0.05).round(2)
     return summary.reset_index().sort_values("promedio", ascending=False).reset_index(drop=True)
 
 
-# Layout estándar para todas las gráficas (labels negros, alta legibilidad)
+def calcular_resumen(df):
+    if df.empty: return pd.DataFrame()
+    key = f"{len(df)}-{df['pml'].sum():.0f}"
+    return calcular_resumen_cached(key, df)
+
+
+# Layout estándar para gráficas
 def _layout_estandar(titulo, height=480):
     return dict(
         title=dict(
@@ -943,14 +1249,15 @@ def _layout_estandar(titulo, height=480):
         height=height,
         plot_bgcolor="white",
         paper_bgcolor="white",
-        font=dict(family="Arial", size=12, color=TEXT_DARK),  # ← Color principal
+        font=dict(family="Arial", size=12, color=TEXT_DARK),
         margin=dict(l=70, r=40, t=70, b=60),
         hoverlabel=dict(bgcolor="white", font_size=12, font_color=TEXT_DARK,
                         bordercolor=AXIS_LINE),
+        uirevision='constant',  # mantiene zoom/pan al actualizar
     )
 
 
-def _ejes_estandar(fig, x_title=None, y_title=None, y_dollar=True):
+def _ejes_estandar(fig, x_title=None, y_title=None):
     fig.update_xaxes(
         showgrid=True, gridcolor=GRID_LIGHT,
         linecolor=AXIS_LINE, linewidth=1.5,
@@ -1048,9 +1355,7 @@ def grafica_barras_top(df, metrica="promedio", top_n=10):
     else: return None
     top = summary.nlargest(top_n, col).round(2)
 
-    # Texto en negro arriba de cada barra
     text_template = "%{x:.2f}" if metrica != "negativos" else "%{x:.1f}%"
-
     fig = go.Figure()
     fig.add_trace(go.Bar(
         x=top[col], y=top["nodo"],
@@ -1069,26 +1374,25 @@ def grafica_barras_top(df, metrica="promedio", top_n=10):
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# BESS SCORING (rank-percentile, igual que v64)
+# BESS SCORING
 # ═══════════════════════════════════════════════════════════════════════
-# Pesos por defecto por caso de uso
 PESOS_BESS = {
     'Arbitraje': {
-        'spread_p95_p5':    0.30,  # Diferencia P95-P5 (oportunidad arbitraje)
-        'spread_avg_diario': 0.25,  # Spread día promedio (max-min)
+        'spread_p95_p5':    0.30,
+        'spread_avg_diario': 0.25,
         'volatilidad':      0.20,
-        'horas_pico':       0.15,  # Veces que toca tope alto
+        'horas_pico':       0.15,
         'pml_promedio':     0.10,
     },
     'Servicios Auxiliares': {
-        'volatilidad':      0.40,  # SSAA paga la volatilidad
-        'cambios_bruscos':  0.30,  # # de cambios horarios fuertes
+        'volatilidad':      0.40,
+        'cambios_bruscos':  0.30,
         'pml_promedio':     0.15,
         'spread_p95_p5':    0.15,
     },
     'Renewables Firming': {
-        'pct_horas_neg':    0.35,  # Buena oportunidad de cargar barato
-        'spread_dia':       0.30,  # Diferencia inyección día/noche
+        'pct_horas_neg':    0.35,
+        'spread_dia':       0.30,
         'spread_p95_p5':    0.20,
         'pml_promedio':     0.15,
     },
@@ -1101,49 +1405,47 @@ DESCRIPCIONES_USE_CASE = {
                              'frecuencia y voltaje. Premia volatilidad y cambios '
                              'bruscos en el precio.',
     'Renewables Firming': '🌅 **Firming de Renovables** — Acompañar generación solar/eólica. '
-                           'Premia horas con precios negativos (carga barata) y '
-                           'diferencial día-noche.',
+                           'Premia horas con precios negativos y diferencial día-noche.',
+}
+
+DESCRIPCIONES_USE_CASE_PLAIN = {
+    'Arbitraje': 'Arbitraje energético — Premia spread alto, volatilidad y picos de precio.',
+    'Servicios Auxiliares': 'Servicios Auxiliares — Premia volatilidad y cambios bruscos.',
+    'Renewables Firming': 'Renewables Firming — Premia horas negativas y diferencial día-noche.',
 }
 
 
-def calcular_metricas_bess(df):
-    """Calcula métricas raw por nodo. Retorna DataFrame."""
-    if df.empty: return pd.DataFrame()
-
+@st.cache_data(show_spinner=False, max_entries=3)
+def calcular_metricas_bess_cached(df_hash, _df):
+    if _df.empty: return pd.DataFrame()
     metricas = []
-    for nodo in df["nodo"].unique():
-        sub = df[df["nodo"] == nodo].copy()
+    for nodo in _df["nodo"].unique():
+        sub = _df[_df["nodo"] == nodo].copy()
         pml = sub["pml"].values
         if len(pml) == 0: continue
 
-        # Métricas básicas
         prom = pml.mean()
         std_v = pml.std()
         p95 = np.percentile(pml, 95)
         p5  = np.percentile(pml, 5)
         spread_p95_p5 = p95 - p5
 
-        # Spread día promedio (max-min por día)
         sub["fecha_only"] = sub["fecha_dt"].dt.date
         daily = sub.groupby("fecha_only")["pml"].agg(['min', 'max', 'mean'])
         daily["spread"] = daily["max"] - daily["min"]
         spread_avg_diario = daily["spread"].mean() if not daily.empty else 0
         spread_dia = daily["max"].mean() - daily["min"].mean() if not daily.empty else 0
 
-        # Cambios bruscos hora-a-hora
         sub_sorted = sub.sort_values(["fecha_dt", "hora"])
         diffs = sub_sorted["pml"].diff().abs()
         threshold = std_v * 1.5 if std_v > 0 else 0
         cambios_bruscos = (diffs > threshold).sum()
 
-        # Horas pico
         threshold_pico = p95
         horas_pico = (pml > threshold_pico).sum()
 
-        # % horas negativas
         pct_neg = (pml < 0).mean() * 100
 
-        info = catalogo.get(nodo, {}) if 'catalogo' in dir() else {}
         metricas.append({
             'nodo':          nodo,
             'pml_promedio':  round(prom, 2),
@@ -1159,41 +1461,38 @@ def calcular_metricas_bess(df):
     return pd.DataFrame(metricas)
 
 
+def calcular_metricas_bess(df):
+    if df.empty: return pd.DataFrame()
+    key = f"{len(df)}-{df['pml'].sum():.0f}"
+    return calcular_metricas_bess_cached(key, df)
+
+
 def calcular_score_bess(df_metricas, use_case, pesos=None):
-    """Calcula score BESS usando rank-percentile (mismo que v64).
-    
-    Cada métrica se rankea entre 0 y 1 (mejor=1, peor=0), luego se pondera.
-    """
+    """Score con rank-percentile."""
     if df_metricas.empty: return pd.DataFrame()
     if pesos is None: pesos = PESOS_BESS.get(use_case, PESOS_BESS['Arbitraje'])
 
     df = df_metricas.copy()
-
-    # Para cada métrica usada, calcular rank-percentile
-    # Mayor valor = mejor para todas las métricas usadas
     score = pd.Series(0.0, index=df.index)
     for metrica, peso in pesos.items():
         if metrica not in df.columns: continue
-        # Rank-percentile: 0=peor, 1=mejor
         ranks = df[metrica].rank(pct=True, method='average')
         score += ranks * peso
 
-    df['score'] = (score * 100).round(1)  # 0-100
+    df['score'] = (score * 100).round(1)
     return df.sort_values('score', ascending=False).reset_index(drop=True)
 
 
 def grafica_bess_ranking(df_score, use_case, top_n=15):
-    """Gráfica de barras horizontales con scores BESS."""
     if df_score.empty: return None
     top = df_score.nlargest(top_n, 'score').copy()
 
-    # Color por percentil del score
     colors = []
     for s in top['score']:
-        if s >= 75: colors.append("#1a8a3a")     # Verde — top
+        if s >= 75: colors.append("#1a8a3a")
         elif s >= 50: colors.append("#9bc24f")
-        elif s >= 25: colors.append("#f5d017")   # Amarillo — medio
-        else: colors.append("#a0090c")            # Rojo — bajo
+        elif s >= 25: colors.append("#f5d017")
+        else: colors.append("#a0090c")
 
     fig = go.Figure()
     fig.add_trace(go.Bar(
@@ -1213,8 +1512,14 @@ def grafica_bess_ranking(df_score, use_case, top_n=15):
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# MAPA INTERACTIVO — pin-style markers
+# MAPA INTERACTIVO con LEYENDA CCR
 # ═══════════════════════════════════════════════════════════════════════
+def _ccr_color_map(matches_df):
+    """Asigna un color de PALETTE a cada CCR único en el dataframe."""
+    ccrs_unique = sorted(matches_df['ccr'].fillna('?').unique())
+    return {ccr: PALETTE[i % len(PALETTE)] for i, ccr in enumerate(ccrs_unique)}
+
+
 def grafica_mapa(matches_df, df_pml=None, color_by='pml'):
     """color_by: 'pml' (con datos) o 'ccr' (modo solo mapa)."""
     matches_ok = matches_df[matches_df['lat'].notna()].copy()
@@ -1260,9 +1565,7 @@ def grafica_mapa(matches_df, df_pml=None, color_by='pml'):
     else:
         # Modo solo mapa: colorear por CCR
         map_df = matches_ok.copy()
-        ccrs_unique = sorted(map_df['ccr'].fillna('?').unique())
-        ccr_to_color = {c: PALETTE[i % len(PALETTE)] for i, c in enumerate(ccrs_unique)}
-
+        ccr_to_color = _ccr_color_map(map_df)
         map_df['hover'] = map_df.apply(
             lambda r: (
                 f"<b>{r['clave']}</b><br>"
@@ -1299,64 +1602,47 @@ def grafica_mapa(matches_df, df_pml=None, color_by='pml'):
 
     fig = go.Figure()
 
-    # Capa 1: halo blanco grande (background)
+    # Capa 1: halo blanco grande
     fig.add_trace(go.Scattermapbox(
-        lat=map_df['lat'],
-        lon=map_df['lon'],
+        lat=map_df['lat'], lon=map_df['lon'],
         mode='markers',
         marker=dict(size=28, color='white', opacity=0.95),
-        hoverinfo='skip',
-        showlegend=False,
+        hoverinfo='skip', showlegend=False,
     ))
 
-    # Capa 2: marker principal con color y borde
+    # Capa 2: marker con color
     if color_by == 'pml' and showscale:
         fig.add_trace(go.Scattermapbox(
-            lat=map_df['lat'],
-            lon=map_df['lon'],
+            lat=map_df['lat'], lon=map_df['lon'],
             mode='markers+text',
             marker=dict(
-                size=20,
-                color=marker_color,
-                colorscale=colorscale,
-                cmin=cmin, cmax=cmax,
-                colorbar=colorbar,
-                showscale=True,
+                size=20, color=marker_color,
+                colorscale=colorscale, cmin=cmin, cmax=cmax,
+                colorbar=colorbar, showscale=True,
                 opacity=0.95,
             ),
-            text=map_df['clave'],
-            textposition="top right",
+            text=map_df['clave'], textposition="top right",
             textfont=dict(size=11, color=TEXT_TITLE, family="Arial Black"),
-            hovertext=map_df['hover'],
-            hoverinfo='text',
-            name='Nodos',
+            hovertext=map_df['hover'], hoverinfo='text',
+            name='Nodos', showlegend=False,
         ))
     else:
         fig.add_trace(go.Scattermapbox(
-            lat=map_df['lat'],
-            lon=map_df['lon'],
+            lat=map_df['lat'], lon=map_df['lon'],
             mode='markers+text',
-            marker=dict(
-                size=20,
-                color=marker_color,
-                opacity=0.95,
-            ),
-            text=map_df['clave'],
-            textposition="top right",
+            marker=dict(size=20, color=marker_color, opacity=0.95),
+            text=map_df['clave'], textposition="top right",
             textfont=dict(size=11, color=TEXT_TITLE, family="Arial Black"),
-            hovertext=map_df['hover'],
-            hoverinfo='text',
-            name='Nodos',
+            hovertext=map_df['hover'], hoverinfo='text',
+            name='Nodos', showlegend=False,
         ))
 
     # Capa 3: punto central pequeño negro
     fig.add_trace(go.Scattermapbox(
-        lat=map_df['lat'],
-        lon=map_df['lon'],
+        lat=map_df['lat'], lon=map_df['lon'],
         mode='markers',
         marker=dict(size=4, color=TEXT_DARK, opacity=1.0),
-        hoverinfo='skip',
-        showlegend=False,
+        hoverinfo='skip', showlegend=False,
     ))
 
     titulo_mapa = (f"📍 Mapa interactivo · {len(map_df)} nodos · "
@@ -1379,8 +1665,37 @@ def grafica_mapa(matches_df, df_pml=None, color_by='pml'):
         paper_bgcolor="white",
         hoverlabel=dict(bgcolor="white", font_size=12, font_color=TEXT_DARK,
                         bordercolor=AXIS_LINE),
+        uirevision='constant',
     )
     return fig
+
+
+def render_leyenda_ccr(matches_df):
+    """Leyenda de CCR debajo del mapa con colores y conteo."""
+    matches_ok = matches_df[matches_df['lat'].notna()].copy()
+    if matches_ok.empty: return
+
+    ccr_to_color = _ccr_color_map(matches_ok)
+    counts = matches_ok['ccr'].fillna('?').value_counts()
+
+    items_html = ""
+    for ccr in sorted(ccr_to_color.keys()):
+        color = ccr_to_color[ccr]
+        count = counts.get(ccr, 0)
+        items_html += (
+            f'<span class="ccr-legend-item">'
+            f'<span class="ccr-dot" style="background:{color}"></span>'
+            f'<b>{ccr}</b> ({count})'
+            f'</span>'
+        )
+
+    legend_html = (
+        f'<div class="ccr-legend">'
+        f'<b style="color:{TEXT_DARK};font-size:0.92rem;">📍 CCRs en esta consulta:</b><br>'
+        f'{items_html}'
+        f'</div>'
+    )
+    st.markdown(legend_html, unsafe_allow_html=True)
 
 
 def render_panel_ccr(matches_df, df_pml=None):
@@ -1411,7 +1726,6 @@ def render_panel_ccr(matches_df, df_pml=None):
             },
         )
     else:
-        # Modo solo mapa: solo conteo por CCR
         ccr_stats = matches_ok.groupby('ccr').agg(
             nodos=('clave', 'count'),
         ).reset_index().sort_values('nodos', ascending=False)
@@ -1427,13 +1741,13 @@ def render_panel_ccr(matches_df, df_pml=None):
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# RENDER BESS SCORING SECTION
+# RENDER BESS SCORING
 # ═══════════════════════════════════════════════════════════════════════
 def render_bess_scoring(df, use_case_default='Arbitraje'):
     st.divider()
     st.markdown("## 🔋 BESS Scoring")
-    st.caption("Ranking de nodos por idoneidad para distintos casos de uso de almacenamiento. "
-               "El score (0-100) usa rank-percentile de cada nodo dentro del set consultado.")
+    st.caption("Ranking de nodos por idoneidad para distintos casos de uso. "
+               "Score 0-100 usando rank-percentile.")
 
     use_case = st.selectbox(
         "Caso de uso",
@@ -1444,18 +1758,15 @@ def render_bess_scoring(df, use_case_default='Arbitraje'):
     st.markdown(f"<div class='mode-badge'>{DESCRIPCIONES_USE_CASE[use_case]}</div>",
                 unsafe_allow_html=True)
 
-    # Calcular métricas
     df_metricas = calcular_metricas_bess(df)
     if df_metricas.empty:
         st.warning("No hay suficientes datos para calcular métricas BESS.")
         return
 
-    # Pesos custom (en expander)
     pesos_default = PESOS_BESS[use_case].copy()
     pesos = pesos_default.copy()
     with st.expander("⚙️ Ajustar pesos del scoring (opcional)"):
-        st.caption("Los pesos deben sumar aproximadamente 1.0. Cada métrica se "
-                   "rankea entre 0 y 1 dentro del set.")
+        st.caption("Los pesos se normalizarán automáticamente.")
         col_p = st.columns(min(3, len(pesos_default)))
         for i, (metrica, valor) in enumerate(pesos_default.items()):
             with col_p[i % len(col_p)]:
@@ -1466,14 +1777,11 @@ def render_bess_scoring(df, use_case_default='Arbitraje'):
                 )
         suma = sum(pesos.values())
         if abs(suma - 1.0) > 0.05:
-            st.warning(f"⚠️ Pesos suman {suma:.2f} (debería ser ~1.0). "
-                        "Se normalizarán automáticamente.")
+            st.caption(f"⚠️ Pesos suman {suma:.2f}, se normalizará a 1.0")
             pesos = {k: v/suma for k, v in pesos.items()} if suma > 0 else pesos_default
 
-    # Calcular scoring
     df_score = calcular_score_bess(df_metricas, use_case, pesos=pesos)
 
-    # Top 3 destacado
     st.markdown("### 🏆 Top 3 nodos recomendados")
     top3 = df_score.head(3)
     cols_t = st.columns(3)
@@ -1488,21 +1796,15 @@ def render_bess_scoring(df, use_case_default='Arbitraje'):
                       f"Spread P95-P5: ${row['spread_p95_p5']:.2f}")
             )
 
-    # Gráfica ranking
-    fig_rank = grafica_bess_ranking(df_score, use_case,
-                                      top_n=min(15, len(df_score)))
-    if fig_rank:
-        st.plotly_chart(fig_rank, use_container_width=True)
+    fig_rank = grafica_bess_ranking(df_score, use_case, top_n=min(15, len(df_score)))
+    if fig_rank: st.plotly_chart(fig_rank, use_container_width=True)
 
-    # Tabla completa
     st.markdown("### 📋 Tabla completa con métricas")
     st.dataframe(
-        df_score,
-        use_container_width=True,
-        hide_index=True,
+        df_score, use_container_width=True, hide_index=True,
         column_config={
             "nodo":           st.column_config.TextColumn("Clave", width="small"),
-            "score":          st.column_config.NumberColumn("Score BESS", format="%.1f", help="0 (peor) a 100 (mejor)"),
+            "score":          st.column_config.NumberColumn("Score BESS", format="%.1f"),
             "pml_promedio":   st.column_config.NumberColumn("PML promedio", format="$%.2f"),
             "volatilidad":    st.column_config.NumberColumn("Volatilidad", format="$%.2f"),
             "spread_p95_p5":  st.column_config.NumberColumn("Spread P95-P5", format="$%.2f"),
@@ -1516,9 +1818,9 @@ def render_bess_scoring(df, use_case_default='Arbitraje'):
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# RENDER DASHBOARD COMPLETO
+# RENDER DASHBOARD COMPLETO (sin Excel - solo análisis)
 # ═══════════════════════════════════════════════════════════════════════
-def render_dashboard(acumulado, catalogo, matches_df=None, generar_kmz_flag=False):
+def render_dashboard(acumulado, catalogo, matches_df=None):
     st.divider()
     st.markdown("## 📊 Dashboard analítico")
     st.caption("Pasa el mouse sobre los gráficos para ver valores específicos.")
@@ -1557,6 +1859,10 @@ def render_dashboard(acumulado, catalogo, matches_df=None, generar_kmz_flag=Fals
 
             fig_mapa = grafica_mapa(matches_df, df, color_by='pml')
             if fig_mapa: st.plotly_chart(fig_mapa, use_container_width=True)
+
+            # Leyenda CCR
+            render_leyenda_ccr(matches_df)
+
             render_panel_ccr(matches_df, df)
 
             sin_match = matches_df[matches_df['lat'].isna()]
@@ -1566,17 +1872,6 @@ def render_dashboard(acumulado, catalogo, matches_df=None, generar_kmz_flag=Fals
                         sin_match[['clave', 'nombre_cenace', 'ccr', 'estado', 'razon']],
                         use_container_width=True, hide_index=True,
                     )
-
-            if generar_kmz_flag and n_mapeados > 0:
-                with st.spinner("Generando KMZ..."):
-                    kmz_bytes = generar_kmz(matches_df)
-                ts = datetime.now().strftime("%Y%m%d_%H%M")
-                st.download_button(
-                    label=f"🌍 Descargar KMZ para Google Earth Pro ({n_mapeados} nodos)",
-                    data=kmz_bytes,
-                    file_name=f"PML_CENACE_Geo_{ts}.kmz",
-                    mime="application/vnd.google-earth.kmz",
-                )
 
     # TABLA RESUMEN
     st.markdown("### 📋 Tabla resumen por nodo")
@@ -1622,8 +1917,88 @@ def render_dashboard(acumulado, catalogo, matches_df=None, generar_kmz_flag=Fals
         fig = grafica_barras_top(df, "negativos", top_n=min(10, len(acumulado)))
         if fig: st.plotly_chart(fig, use_container_width=True)
 
-    # BESS scoring al final
+    # BESS scoring
     render_bess_scoring(df)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# RENDER CENTRO DE DESCARGAS (Modo Solo Datos)
+# ═══════════════════════════════════════════════════════════════════════
+def render_centro_descargas(acumulado, catalogo, sistema, proceso, fecha_ini, fecha_fin,
+                              matches_df=None):
+    st.divider()
+    st.markdown("## 📥 Centro de descargas")
+    st.caption("Selecciona los archivos que necesites descargar.")
+
+    df = acumulado_a_dataframe(acumulado, catalogo)
+    df_resumen = calcular_resumen(df) if not df.empty else pd.DataFrame()
+    df_metricas = calcular_metricas_bess(df) if not df.empty else pd.DataFrame()
+    ts = datetime.now().strftime("%Y%m%d_%H%M")
+
+    col1, col2, col3 = st.columns(3)
+
+    with col1:
+        st.markdown("##### 📊 Excel de Datos")
+        st.caption("Datos PML completos: portada + resumen + 1 hoja por nodo con todos los registros horarios.")
+        if "excel_datos_bytes" not in st.session_state:
+            st.session_state["excel_datos_bytes"] = None
+        if st.button("Generar Excel datos", key="btn_gen_datos", type="primary"):
+            with st.spinner("Generando Excel de datos..."):
+                st.session_state["excel_datos_bytes"] = generar_excel_datos(
+                    acumulado, sistema, proceso, fecha_ini, fecha_fin)
+        if st.session_state["excel_datos_bytes"]:
+            st.download_button(
+                label="📥 Descargar",
+                data=st.session_state["excel_datos_bytes"],
+                file_name=f"PML_CENACE_Datos_{sistema}_{ts}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="dl_datos",
+            )
+
+    with col2:
+        st.markdown("##### 📈 Excel de Análisis")
+        st.caption("BESS Scoring para los 3 casos de uso + métricas calculadas + resumen estadístico.")
+        if "excel_analisis_bytes" not in st.session_state:
+            st.session_state["excel_analisis_bytes"] = None
+        if st.button("Generar Excel análisis", key="btn_gen_anal", type="primary"):
+            if df_metricas.empty:
+                st.error("No hay suficientes datos para generar análisis.")
+            else:
+                with st.spinner("Generando Excel de análisis..."):
+                    st.session_state["excel_analisis_bytes"] = generar_excel_analisis(
+                        df_metricas, df_resumen, sistema, proceso, fecha_ini, fecha_fin)
+        if st.session_state["excel_analisis_bytes"]:
+            st.download_button(
+                label="📥 Descargar",
+                data=st.session_state["excel_analisis_bytes"],
+                file_name=f"PML_CENACE_Analisis_BESS_{sistema}_{ts}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="dl_anal",
+            )
+
+    with col3:
+        st.markdown("##### 🌍 KMZ Geográfico")
+        st.caption("Ubicación de los nodos en Google Earth Pro. Requiere geocodificación.")
+        if matches_df is None or matches_df.empty:
+            st.info("⚠️ La geocodificación no se hizo. Activa el toggle '🗺️ Incluir geocodificación' en el sidebar y vuelve a ejecutar.")
+        else:
+            n_mapeados = matches_df['lat'].notna().sum()
+            if n_mapeados == 0:
+                st.warning("Ningún nodo pudo ser mapeado.")
+            else:
+                if "kmz_bytes" not in st.session_state:
+                    st.session_state["kmz_bytes"] = None
+                if st.button(f"Generar KMZ ({n_mapeados} nodos)", key="btn_gen_kmz", type="primary"):
+                    with st.spinner("Generando KMZ..."):
+                        st.session_state["kmz_bytes"] = generar_kmz(matches_df)
+                if st.session_state["kmz_bytes"]:
+                    st.download_button(
+                        label="📥 Descargar",
+                        data=st.session_state["kmz_bytes"],
+                        file_name=f"PML_CENACE_Geo_{ts}.kmz",
+                        mime="application/vnd.google-earth.kmz",
+                        key="dl_kmz",
+                    )
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -1645,19 +2020,28 @@ if catalogo:
 else:
     st.warning("⚠️ Catálogo no cargado.")
 
+# Inicializar session_state
+if "consulta_ejecutada" not in st.session_state:
+    st.session_state["consulta_ejecutada"] = False
+if "acumulado" not in st.session_state:
+    st.session_state["acumulado"] = {}
+if "matches_df" not in st.session_state:
+    st.session_state["matches_df"] = None
+if "consulta_params" not in st.session_state:
+    st.session_state["consulta_params"] = {}
+
 with st.sidebar:
     st.markdown("### ⚙️ Configuración")
 
-    # MODO DE USO
     st.markdown("**🚀 Modo de uso**")
     modo = st.radio(
         "Selecciona qué hacer:",
         options=["🚀 Completo", "📊 Solo datos", "🗺️ Solo mapa"],
         index=0,
         help=(
-            "**Completo**: descarga datos + mapa + Excel + BESS scoring (1-5 min)\n\n"
-            "**Solo datos**: descarga datos PML, genera Excel y dashboard sin mapa (1-3 min)\n\n"
-            "**Solo mapa**: solo geocodifica (sin datos PML, sin Excel, ~5 segundos)"
+            "**Completo**: descarga + dashboard + mapa + BESS scoring (sin Excel)\n\n"
+            "**Solo datos**: descarga + Centro de descargas (Excel/KMZ)\n\n"
+            "**Solo mapa**: solo geocodifica (~5 segundos)"
         ),
         label_visibility="collapsed",
     )
@@ -1674,41 +2058,38 @@ with st.sidebar:
         "Lista de claves",
         height=150,
         placeholder="01VAJ-230\n01XAL-230\n06FUN-115",
+        key="nodos_input",
     )
 
-    # Sólo mostrar parámetros relevantes según modo
     if necesita_datos:
         col1, col2 = st.columns(2)
         with col1:
-            sistema = st.selectbox("Sistema", ["SIN", "BCA", "BCS"], index=0)
+            sistema = st.selectbox("Sistema", ["SIN", "BCA", "BCS"], index=0, key="sistema_sel")
         with col2:
-            proceso = st.selectbox("Proceso", ["MTR", "MDA"], index=0)
+            proceso = st.selectbox("Proceso", ["MTR", "MDA"], index=0, key="proceso_sel")
 
         st.markdown("**📅 Período**")
         col_f1, col_f2 = st.columns(2)
         today = date.today()
         with col_f1:
-            f_ini = st.date_input("Desde", value=today - timedelta(days=90), max_value=today)
+            f_ini = st.date_input("Desde", value=today - timedelta(days=90), max_value=today, key="f_ini")
         with col_f2:
-            f_fin = st.date_input("Hasta", value=today - timedelta(days=1), max_value=today)
+            f_fin = st.date_input("Hasta", value=today - timedelta(days=1), max_value=today, key="f_fin")
     else:
         sistema = "SIN"; proceso = "MTR"
         today = date.today()
         f_ini = today - timedelta(days=90)
         f_fin = today - timedelta(days=1)
 
-    if necesita_mapa:
+    # Toggle de geocodificación en modo solo datos
+    if es_solo_datos:
         st.markdown("**🗺️ Geocodificación**")
-        generar_kmz_flag = st.toggle("Generar KMZ descargable", value=False,
-                                       help="Para abrir en Google Earth Pro")
+        incluir_geo_solo_datos = st.toggle("Incluir geocodificación",
+                                            value=False,
+                                            key="toggle_geo_datos",
+                                            help="Activar si vas a descargar el KMZ. Tarda ~5s extra.")
     else:
-        generar_kmz_flag = False
-
-    if necesita_datos:
-        st.markdown("**⚡ Performance**")
-        max_workers = st.slider("Workers paralelos", 3, 12, 8)
-    else:
-        max_workers = 8
+        incluir_geo_solo_datos = False
 
     st.divider()
     st.caption("Sebastian Roldan (SRF)\nRecurrent Energy · Canadian Solar")
@@ -1718,13 +2099,10 @@ col_left, col_right = st.columns([2, 1])
 with col_left:
     st.markdown("### 🚀 Ejecutar consulta")
 
-    # Indicador del modo activo
     modo_descripcion = {
-        "🚀 Completo": ("Descargará datos PML + mapeará nodos + generará Excel + "
-                        "calculará BESS scoring."),
-        "📊 Solo datos": "Descargará datos PML y generará Excel + dashboard analítico (sin mapa).",
-        "🗺️ Solo mapa": ("Solo localizará los nodos en OpenStreetMap. "
-                          "<b>No descargará datos PML ni generará Excel</b> — mucho más rápido."),
+        "🚀 Completo": "Descargará datos PML + mapeará nodos + dashboard + BESS scoring (sin Excel).",
+        "📊 Solo datos": "Descargará datos PML y mostrará un Centro de Descargas con Excel/KMZ.",
+        "🗺️ Solo mapa": ("Solo localizará los nodos en OpenStreetMap. <b>Sin descargar PML.</b>"),
     }
     st.markdown(
         f"<div class='mode-badge'><b>Modo: {modo}</b><br>{modo_descripcion[modo]}</div>",
@@ -1754,7 +2132,7 @@ with col_left:
         n_bloques = (n_dias + BLOQUE_MAX - 1) // BLOQUE_MAX
         n_lotes = (len(nodos) + 9) // 10
         n_consultas = n_bloques * n_lotes
-        tiempo = n_consultas * 1.5 / max_workers
+        tiempo = n_consultas * 1.5 / MAX_WORKERS
         st.caption(f"📊 **{n_dias} días · {n_consultas} consultas · ~{tiempo/60:.1f} min**")
     elif nodos and es_solo_mapa:
         st.caption(f"🗺️ Solo geocodificación de **{len(nodos)} nodos** (~5 segundos)")
@@ -1767,7 +2145,7 @@ with col_right:
         st.markdown("""
         1. Pega claves de nodos
         2. Click en **Ejecutar**
-        3. Ve la ubicación geográfica de tus nodos en el mapa
+        3. Ve la ubicación geográfica en el mapa
         
         ⚡ **Modo rápido**: no descarga datos PML.
         """)
@@ -1775,26 +2153,35 @@ with col_right:
         st.markdown("""
         1. Pega claves de nodos
         2. Selecciona sistema, proceso, fechas
-        3. Click en **Ejecutar**
-        4. Descarga el Excel y explora el dashboard
+        3. (Opcional) Activa geocodificación si quieres KMZ
+        4. Click en **Ejecutar**
+        5. Genera y descarga lo que necesites del Centro de Descargas
         """)
     else:
         st.markdown("""
         1. Pega claves de nodos
         2. Selecciona sistema, proceso, fechas
         3. Click en **Ejecutar**
-        4. Mira mapa, dashboard y BESS scoring
-        5. Descarga Excel/KMZ si lo necesitas
+        4. Explora dashboard interactivo + BESS scoring
+        
+        💡 Para descargar archivos: usa modo **Solo datos**.
         """)
 
 
+# ═══════════════════════════════════════════════════════════════════════
+# EJECUCIÓN — guarda resultado en session_state
+# ═══════════════════════════════════════════════════════════════════════
 if boton and nodos:
     fecha_ini = f_ini.strftime("%Y/%m/%d")
     fecha_fin = f_fin.strftime("%Y/%m/%d")
     t0 = time.time()
 
+    # Limpiar estado previo de descargas
+    for k in ["excel_datos_bytes", "excel_analisis_bytes", "kmz_bytes"]:
+        if k in st.session_state:
+            st.session_state[k] = None
+
     try:
-        # Si necesita datos, descargar primero
         acumulado = {}
         errores = []
         if necesita_datos:
@@ -1803,105 +2190,110 @@ if boton and nodos:
                 st.stop()
 
             progress = st.progress(0, text="Iniciando descarga...")
-
             def cb(done, total):
                 progress.progress(done/total,
                                   text=f"Descargando: {done}/{total} ({done/total*100:.0f}%)")
 
             with st.spinner("Consultando CENACE..."):
                 acumulado, errores = descargar_pml(
-                    nodos, fecha_ini, fecha_fin, sistema, proceso,
-                    max_workers=max_workers, progress_cb=cb,
+                    nodos, fecha_ini, fecha_fin, sistema, proceso, progress_cb=cb,
                 )
-            progress.progress(1.0, text=f"✅ Datos descargados")
+            progress.progress(1.0, text="✅ Datos descargados")
 
             if not acumulado:
                 st.error("❌ No se recibieron datos PML.")
                 st.stop()
 
-            n_total = sum(len(f) for f in acumulado.values())
-            cx, cy, cz = st.columns(3)
-            cx.metric("Nodos con datos", f"{len(acumulado)}/{len(nodos)}")
-            cy.metric("Total registros", f"{n_total:,}")
-            cz.metric("Tiempo descarga", f"{time.time()-t0:.0f}s")
-
-            if errores:
-                with st.expander(f"⚠️ {len(errores)} errores"):
-                    st.dataframe(pd.DataFrame(errores[:20]), use_container_width=True)
-
-            # Excel
-            st.markdown("### 📥 Descargar Excel")
-            with st.spinner("Generando Excel..."):
-                excel_bytes = generar_excel_datos(acumulado, sistema, proceso, fecha_ini, fecha_fin)
-            ts = datetime.now().strftime("%Y%m%d_%H%M")
-            st.download_button(
-                label=f"📊 Descargar PML_CENACE_{sistema}_{ts}.xlsx",
-                data=excel_bytes,
-                file_name=f"PML_CENACE_{sistema}_{ts}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                type="primary",
-            )
-
-        # Si necesita mapa, hacer matching
+        # Geocodificación si necesita mapa O si en solo datos pidió geo
         matches_df = None
-        if necesita_mapa:
-            st.markdown("### 🗺️ Geocodificación de nodos")
+        if necesita_mapa or (es_solo_datos and incluir_geo_solo_datos):
             with st.spinner("Cargando OSM (primera vez ~30s)..."):
                 osm_subs = cargar_osm_subestaciones()
             if osm_subs:
-                st.caption(f"📍 {len(osm_subs):,} subestaciones OSM cargadas. Matcheando...")
                 with st.spinner("Matcheando nodos con OSM..."):
                     nodos_a_matchear = list(acumulado.keys()) if necesita_datos else nodos
                     resultados = matchear_nodos(nodos_a_matchear, catalogo, osm_subs)
                     matches_df = pd.DataFrame(resultados)
-            else:
-                st.warning("⚠️ No se pudieron cargar las subestaciones OSM.")
 
-        # Render según modo
-        if es_solo_mapa:
-            # Sólo mapa
-            if matches_df is not None and not matches_df.empty:
-                n_mapeados = matches_df['lat'].notna().sum()
-                n_consultados = len(matches_df)
-                cm1, cm2, cm3 = st.columns(3)
-                cm1.metric("Mapeados", f"{n_mapeados}/{n_consultados}")
-                cc = matches_df['calidad'].value_counts()
-                cm2.metric("🥇 Excelente / 🥈 Bueno",
-                            f"{cc.get('🥇 Excelente', 0)} / {cc.get('🥈 Bueno', 0)}")
-                cm3.metric("🥉 Aceptable", cc.get('🥉 Aceptable', 0))
-
-                if n_mapeados > 0:
-                    fig_mapa = grafica_mapa(matches_df, color_by='ccr')
-                    if fig_mapa: st.plotly_chart(fig_mapa, use_container_width=True)
-                    render_panel_ccr(matches_df, None)
-
-                    sin_match = matches_df[matches_df['lat'].isna()]
-                    if not sin_match.empty:
-                        with st.expander(f"❌ {len(sin_match)} nodos sin match"):
-                            st.dataframe(
-                                sin_match[['clave', 'nombre_cenace', 'ccr', 'estado', 'razon']],
-                                use_container_width=True, hide_index=True,
-                            )
-
-                    if generar_kmz_flag:
-                        with st.spinner("Generando KMZ..."):
-                            kmz_bytes = generar_kmz(matches_df)
-                        ts = datetime.now().strftime("%Y%m%d_%H%M")
-                        st.download_button(
-                            label=f"🌍 Descargar KMZ ({n_mapeados} nodos)",
-                            data=kmz_bytes,
-                            file_name=f"PML_CENACE_Geo_{ts}.kmz",
-                            mime="application/vnd.google-earth.kmz",
-                        )
-        else:
-            # Modo completo o solo datos: dashboard completo
-            render_dashboard(acumulado, catalogo, matches_df, generar_kmz_flag)
-
-        st.success(f"✅ Completado en {time.time()-t0:.0f}s")
+        # Guardar todo en session_state
+        st.session_state["consulta_ejecutada"] = True
+        st.session_state["acumulado"] = acumulado
+        st.session_state["matches_df"] = matches_df
+        st.session_state["consulta_params"] = {
+            "sistema": sistema, "proceso": proceso,
+            "fecha_ini": fecha_ini, "fecha_fin": fecha_fin,
+            "modo": modo, "errores": errores,
+            "tiempo": time.time() - t0,
+        }
 
     except Exception as e:
         st.error(f"❌ Error: {type(e).__name__}: {e}")
         st.exception(e)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# RENDERIZAR RESULTADOS DESDE SESSION_STATE
+# Esto se ejecuta cada vez que cambias algo (heatmap, BESS, etc)
+# pero SIN volver a descargar datos
+# ═══════════════════════════════════════════════════════════════════════
+if st.session_state.get("consulta_ejecutada"):
+    acumulado = st.session_state["acumulado"]
+    matches_df = st.session_state["matches_df"]
+    params = st.session_state["consulta_params"]
+    modo_cur = params.get("modo", modo)
+
+    if necesita_datos and acumulado:
+        n_total = sum(len(f) for f in acumulado.values())
+        cx, cy, cz = st.columns(3)
+        cx.metric("Nodos con datos", f"{len(acumulado)}/{len(nodos) if nodos else len(acumulado)}")
+        cy.metric("Total registros", f"{n_total:,}")
+        cz.metric("Tiempo descarga", f"{params.get('tiempo', 0):.0f}s")
+
+        if params.get("errores"):
+            with st.expander(f"⚠️ {len(params['errores'])} errores en consultas"):
+                st.dataframe(pd.DataFrame(params["errores"][:20]), use_container_width=True)
+
+    # Render según modo
+    if "🗺️" in modo_cur:
+        # Solo mapa
+        if matches_df is not None and not matches_df.empty:
+            n_mapeados = matches_df['lat'].notna().sum()
+            n_consultados = len(matches_df)
+            cm1, cm2, cm3 = st.columns(3)
+            cm1.metric("Mapeados", f"{n_mapeados}/{n_consultados}")
+            cc = matches_df['calidad'].value_counts()
+            cm2.metric("🥇 Excelente / 🥈 Bueno",
+                        f"{cc.get('🥇 Excelente', 0)} / {cc.get('🥈 Bueno', 0)}")
+            cm3.metric("🥉 Aceptable", cc.get('🥉 Aceptable', 0))
+
+            if n_mapeados > 0:
+                fig_mapa = grafica_mapa(matches_df, color_by='ccr')
+                if fig_mapa: st.plotly_chart(fig_mapa, use_container_width=True)
+                render_leyenda_ccr(matches_df)
+                render_panel_ccr(matches_df, None)
+
+                sin_match = matches_df[matches_df['lat'].isna()]
+                if not sin_match.empty:
+                    with st.expander(f"❌ {len(sin_match)} nodos sin match"):
+                        st.dataframe(
+                            sin_match[['clave', 'nombre_cenace', 'ccr', 'estado', 'razon']],
+                            use_container_width=True, hide_index=True,
+                        )
+
+    elif "📊" in modo_cur:
+        # Solo datos: Centro de descargas
+        if acumulado:
+            render_centro_descargas(
+                acumulado, catalogo,
+                params["sistema"], params["proceso"],
+                params["fecha_ini"], params["fecha_fin"],
+                matches_df=matches_df,
+            )
+
+    else:
+        # Modo completo: dashboard sin Excel
+        if acumulado:
+            render_dashboard(acumulado, catalogo, matches_df)
 
 
 st.divider()
