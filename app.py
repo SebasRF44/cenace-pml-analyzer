@@ -1841,9 +1841,17 @@ def generar_kmz(matches_df):
 # ═══════════════════════════════════════════════════════════════════════
 # DATAFRAMES (cached para performance)
 # ═══════════════════════════════════════════════════════════════════════
-@st.cache_data(show_spinner=False, max_entries=3)
-def acumulado_a_dataframe_cached(acumulado_id, _acumulado, _catalogo):
-    """Convierte acumulado a DF con tipos optimizados para memoria."""
+@st.cache_data(show_spinner=False, max_entries=4)
+def acumulado_a_dataframe_cached(acumulado_id, _acumulado, _catalogo, moneda, _fx_lookup):
+    """Convierte acumulado (en MXN base) a DF, aplicando conversión USD si aplica.
+
+    Args:
+        acumulado_id: hash key para invalidar cache
+        _acumulado: dict {nodo: [registros_en_MXN]}  ← SIEMPRE EN MXN
+        _catalogo: catálogo de nodos
+        moneda: "MXN" o "USD" — incluido en cache key
+        _fx_lookup: dict {fecha: TC} para conversión a USD (None si MXN)
+    """
     rows = []
     for nodo, filas in _acumulado.items():
         info = _catalogo.get(nodo, {}) if _catalogo else {}
@@ -1853,6 +1861,16 @@ def acumulado_a_dataframe_cached(acumulado_id, _acumulado, _catalogo):
         for f in filas:
             try: pml_val = float(f["pml"])
             except (TypeError, ValueError): continue
+
+            # Conversión USD si aplica — se hace AQUÍ, no in-place al acumulado
+            if moneda == "USD" and _fx_lookup:
+                fecha_str = f.get("fecha", "")
+                tc = _fx_lookup.get(fecha_str)
+                if tc and tc > 0:
+                    pml_val = pml_val / tc
+                else:
+                    continue  # skip filas sin TC válido
+
             rows.append({
                 "nodo":   nodo,
                 "ccr":    ccr,
@@ -1885,14 +1903,28 @@ def acumulado_a_dataframe_cached(acumulado_id, _acumulado, _catalogo):
     return df
 
 
-def acumulado_a_dataframe(acumulado, catalogo):
-    """Wrapper con hash key para cache."""
+def acumulado_a_dataframe(acumulado, catalogo, moneda=None, fx_lookup=None):
+    """Wrapper que toma moneda + fx_lookup desde session_state si no se pasan.
+
+    El acumulado debe estar SIEMPRE en MXN crudo. La conversión a USD se hace
+    al construir el DataFrame.
+    """
     if not acumulado: return pd.DataFrame()
-    # Hash key: # nodos + total filas + primer nodo
+
+    # Default: leer de session_state si no se pasaron
+    if moneda is None:
+        moneda = st.session_state.get("moneda", "MXN")
+    if fx_lookup is None:
+        fx_info_state = st.session_state.get("fx_info", {})
+        fx_lookup = fx_info_state.get("tc_lookup", {}) if isinstance(fx_info_state, dict) else {}
+
+    # Hash key: # nodos + total filas + primer nodo + moneda (clave!)
+    # La moneda DEBE estar en el cache key para que MXN y USD tengan caches separados
     key = (len(acumulado),
            sum(len(v) for v in acumulado.values()),
-           list(acumulado.keys())[0] if acumulado else "")
-    return acumulado_a_dataframe_cached(str(key), acumulado, catalogo)
+           list(acumulado.keys())[0] if acumulado else "",
+           moneda)
+    return acumulado_a_dataframe_cached(str(key), acumulado, catalogo, moneda, fx_lookup)
 
 
 @st.cache_data(show_spinner=False, max_entries=3)
@@ -2259,7 +2291,20 @@ def calcular_metricas_bess_cached(df_hash, _df):
         daily = sub.groupby("fecha_only")["pml"].agg(['min', 'max', 'mean'])
         daily["spread"] = daily["max"] - daily["min"]
         spread_avg_diario = daily["spread"].mean() if not daily.empty else 0
-        spread_dia = daily["max"].mean() - daily["min"].mean() if not daily.empty else 0
+
+        # Spread día/noche real:
+        # Día = horas 7:00-19:00 (12 horas, generación solar)
+        # Noche = horas 0-6 + 20-23 (12 horas)
+        # Spread = PML promedio noche − PML promedio día
+        # (positivo = noche más cara que día → favorable para BESS firming)
+        horas_dia = sub[(sub["hora"] >= 7) & (sub["hora"] <= 19)]
+        horas_noche = sub[(sub["hora"] < 7) | (sub["hora"] > 19)]
+        if not horas_dia.empty and not horas_noche.empty:
+            pml_dia = horas_dia["pml"].mean()
+            pml_noche = horas_noche["pml"].mean()
+            spread_dia = pml_noche - pml_dia  # diferencial noche − día
+        else:
+            spread_dia = 0
 
         sub_sorted = sub.sort_values(["fecha_dt", "hora"])
         diffs = sub_sorted["pml"].diff().abs()
@@ -2635,7 +2680,10 @@ def render_bess_scoring(df, use_case_default='Arbitraje'):
             "volatilidad":    st.column_config.NumberColumn("Volatilidad", format=fmt_moneda()),
             "spread_p95_p5":  st.column_config.NumberColumn("Spread P95-P5", format=fmt_moneda()),
             "spread_avg_diario": st.column_config.NumberColumn("Spread día prom", format=fmt_moneda()),
-            "spread_dia":     st.column_config.NumberColumn("Spread día/noche", format=fmt_moneda()),
+            "spread_dia":     st.column_config.NumberColumn(
+                "Spread día/noche", format=fmt_moneda(),
+                help="Diferencial PML noche (20:00–6:00) − día (7:00–19:00). "
+                     "Positivo = noche más cara, favorable para BESS firming."),
             "cambios_bruscos": st.column_config.NumberColumn("Cambios bruscos", format="%d"),
             "horas_pico":     st.column_config.NumberColumn("Horas pico", format="%d"),
             "pct_horas_neg":  st.column_config.NumberColumn("% horas neg", format="%.1f%%"),
@@ -3537,8 +3585,11 @@ if boton and nodos:
                                 fechas_unicas.add(f.get("fecha", ""))
                         fx_lookup = construir_fx_lookup(fx_dict, fechas_unicas)
 
-                        # Aplicar conversión
-                        acumulado = aplicar_conversion_usd(acumulado, fx_lookup)
+                        # NOTA: NO aplicamos conversión al acumulado. Se queda en MXN crudo.
+                        # La conversión a USD se hace al construir el DataFrame en
+                        # acumulado_a_dataframe(), usando el fx_lookup guardado en session_state.
+                        # Esto evita el bug de doble-conversión y permite cambiar moneda
+                        # sin re-descargar datos.
 
                         # Guardar info
                         if fx_lookup:
@@ -3611,14 +3662,29 @@ if st.session_state.get("consulta_ejecutada"):
     moneda_actual = st.session_state.get("moneda", "MXN")
     moneda_consulta = params.get("moneda_aplicada", "MXN")
 
+    # ─── Cambio de moneda inteligente ───
+    # MXN→USD instantáneo si ya tenemos fx_lookup
+    # USD→MXN siempre instantáneo (acumulado siempre está en MXN crudo)
+    fx_lookup_disponible = bool(fx_info.get("tc_lookup"))
+    cambio_moneda_instantaneo = False
+    if moneda_actual != moneda_consulta:
+        if moneda_actual == "MXN":
+            # USD → MXN: siempre instantáneo
+            cambio_moneda_instantaneo = True
+        elif moneda_actual == "USD" and fx_lookup_disponible:
+            # MXN → USD con TC ya descargado: instantáneo
+            cambio_moneda_instantaneo = True
+
     # Si cambio el modo entre consulta y ahora pero los datos sirven
     cambio_solo_modo = (modo_cur != modo_consulta_original)
 
     # Cambios que SI requieren re-ejecutar
     parametros_cambiaron = []
     if necesita_datos:
-        if moneda_actual != moneda_consulta:
-            parametros_cambiaron.append(f"moneda ({moneda_consulta} → {moneda_actual})")
+        if moneda_actual != moneda_consulta and not cambio_moneda_instantaneo:
+            parametros_cambiaron.append(
+                f"moneda ({moneda_consulta} → {moneda_actual}) — necesita descargar TC Banxico"
+            )
         # Comparar fechas y sistema/proceso
         f_ini_str = f_ini.strftime("%Y/%m/%d")
         f_fin_str = f_fin.strftime("%Y/%m/%d")
@@ -3655,11 +3721,23 @@ if st.session_state.get("consulta_ejecutada"):
                 f"Da click en **⚡ Ejecutar** para hacer el matching geográfico."
             )
 
-    # Mostrar moneda usada por la consulta vigente
-    st.session_state["moneda"] = moneda_consulta  # forzar render con moneda de consulta
+    # ─── Definir moneda activa para el render ───
+    # Si cambio_moneda_instantaneo: usar la moneda del toggle actual
+    # Si no: usar la moneda con que se hizo la consulta
+    if cambio_moneda_instantaneo:
+        moneda_render = moneda_actual
+        # Limpiar cache de Excel/Custom porque la moneda cambió
+        for k in ("excel_datos_bytes", "excel_analisis_bytes",
+                  "excel_custom_bytes"):
+            if k in st.session_state:
+                st.session_state[k] = None
+    else:
+        moneda_render = moneda_consulta
+
+    st.session_state["moneda"] = moneda_render  # se usa por get_moneda() en gráficas/tablas
 
     # Banner FX si está en USD
-    if moneda_consulta == "USD" and fx_info.get("tc_promedio"):
+    if moneda_render == "USD" and fx_info.get("tc_promedio"):
         st.info(
             f"💱 **Análisis en USD** · "
             f"TC promedio del período: **{fx_info['tc_promedio']:.4f} MXN/USD** · "
@@ -3726,7 +3804,7 @@ if st.session_state.get("consulta_ejecutada"):
                 params["sistema"], params["proceso"],
                 params["fecha_ini"], params["fecha_fin"],
                 matches_df=matches_df,
-                moneda=moneda_consulta,
+                moneda=moneda_render,
                 tc_info=fx_info,
             )
 
