@@ -1168,7 +1168,7 @@ def generar_excel_analisis(df_metricas, df_resumen, sistema, proceso, fecha_ini,
 
     # Hoja Top 5 por caso de uso
     ws_top = wb.create_sheet("🏆 Top 5 por Caso de Uso")
-    ws_top.merge_cells("A1:F1")
+    ws_top.merge_cells("A1:H1")
     c = ws_top["A1"]; c.value = "Top 5 nodos recomendados por caso de uso BESS"
     c.font = Font(bold=True, color=C_WHITE, size=14, name="Arial")
     c.fill = PatternFill("solid", start_color=C_HEADER)
@@ -1181,7 +1181,7 @@ def generar_excel_analisis(df_metricas, df_resumen, sistema, proceso, fecha_ini,
         if df_score.empty: continue
 
         # Header del caso
-        ws_top.merge_cells(f"A{cur_row}:F{cur_row}")
+        ws_top.merge_cells(f"A{cur_row}:H{cur_row}")
         c = ws_top.cell(row=cur_row, column=1)
         c.value = f"⚡ {use_case}"
         c.font = Font(bold=True, color=C_WHITE, size=12, name="Arial")
@@ -1190,20 +1190,26 @@ def generar_excel_analisis(df_metricas, df_resumen, sistema, proceso, fecha_ini,
         ws_top.row_dimensions[cur_row].height = 22
         cur_row += 1
 
-        # Subheader
-        cols_top = ["Rank", "Nodo", "Score", "PML promedio", "Volatilidad", "Spread P95-P5"]
+        # Subheader — añadidos PML día y PML noche
+        cols_top = ["Rank", "Nodo", "Score", "PML promedio",
+                    f"PML día (7-19)", f"PML noche (20-6)",
+                    "Volatilidad", "Spread P95-P5"]
         for ci, col in enumerate(cols_top, 1):
             hdr(ws_top.cell(row=cur_row, column=ci, value=col), bg=C_SUB)
-        ws_top.row_dimensions[cur_row].height = 20
+        ws_top.row_dimensions[cur_row].height = 30
         cur_row += 1
 
         for i, (_, r) in enumerate(df_score.head(5).iterrows(), 1):
             bg = C_ALT if i % 2 == 0 else None
             medal = ['🥇', '🥈', '🥉', '4', '5'][i-1]
-            valores = [medal, r['nodo'], f"{r['score']:.1f}",
-                       f"${r['pml_promedio']:.2f}",
-                       f"${r['volatilidad']:.2f}",
-                       f"${r['spread_p95_p5']:.2f}"]
+            valores = [
+                medal, r['nodo'], f"{r['score']:.1f}",
+                f"{_sym}{r['pml_promedio']:.2f}",
+                f"{_sym}{r.get('pml_dia', 0):.2f}",
+                f"{_sym}{r.get('pml_noche', 0):.2f}",
+                f"{_sym}{r['volatilidad']:.2f}",
+                f"{_sym}{r['spread_p95_p5']:.2f}",
+            ]
             for ci, v in enumerate(valores, 1):
                 cc = ws_top.cell(row=cur_row, column=ci, value=v)
                 cc.font = _FONT_DATO
@@ -1213,7 +1219,7 @@ def generar_excel_analisis(df_metricas, df_resumen, sistema, proceso, fecha_ini,
             cur_row += 1
         cur_row += 1
 
-    for ci, w in enumerate([8, 16, 14, 16, 16, 18], 1):
+    for ci, w in enumerate([8, 16, 12, 16, 16, 16, 14, 16], 1):
         ws_top.column_dimensions[get_column_letter(ci)].width = w
     ws_top.freeze_panes = "A2"
 
@@ -1225,14 +1231,14 @@ def generar_excel_analisis(df_metricas, df_resumen, sistema, proceso, fecha_ini,
         sheet_name = f"BESS {use_case[:22]}"
         ws_bess = wb.create_sheet(title=sheet_name[:31])
 
-        ws_bess.merge_cells("A1:J1")
+        ws_bess.merge_cells("A1:L1")
         c = ws_bess["A1"]; c.value = f"BESS Scoring — {use_case}"
         c.font = Font(bold=True, color=C_WHITE, size=13, name="Arial")
         c.fill = PatternFill("solid", start_color=C_HEADER)
         c.alignment = Alignment(horizontal="center", vertical="center")
         ws_bess.row_dimensions[1].height = 26
 
-        ws_bess.merge_cells("A2:J2")
+        ws_bess.merge_cells("A2:L2")
         c = ws_bess["A2"]
         c.value = DESCRIPCIONES_USE_CASE_PLAIN.get(use_case, "")
         c.font = Font(italic=True, size=10, name="Arial", color="555555")
@@ -1241,6 +1247,7 @@ def generar_excel_analisis(df_metricas, df_resumen, sistema, proceso, fecha_ini,
         ws_bess.row_dimensions[2].height = 20
 
         cols = ["Rank", "Nodo", "Score (0-100)", "PML promedio",
+                "PML día (7-19)", "PML noche (20-6)",
                 "Volatilidad", "Spread P95-P5", "Spread día prom",
                 "Cambios bruscos", "Horas pico", "% horas neg"]
         for ci, col in enumerate(cols, 1):
@@ -1250,6 +1257,7 @@ def generar_excel_analisis(df_metricas, df_resumen, sistema, proceso, fecha_ini,
         for i, (_, r) in enumerate(df_score.iterrows(), 1):
             bg = C_ALT if i % 2 == 0 else None
             valores = [i, r['nodo'], r['score'], r['pml_promedio'],
+                       r.get('pml_dia', 0), r.get('pml_noche', 0),
                        r['volatilidad'], r['spread_p95_p5'],
                        r['spread_avg_diario'], r['cambios_bruscos'],
                        r['horas_pico'], r['pct_horas_neg']]
@@ -1259,10 +1267,10 @@ def generar_excel_analisis(df_metricas, df_resumen, sistema, proceso, fecha_ini,
                 cc.border = BORDE
                 cc.alignment = _ALIGN_NUM if ci != 2 else _ALIGN_TXT
                 if bg: cc.fill = PatternFill("solid", start_color=bg)
-                if ci in (3, 4, 5, 6, 7): cc.number_format = "#,##0.00"
-                elif ci == 10: cc.number_format = "0.0\"%\""
+                if ci in (3, 4, 5, 6, 7, 8, 9): cc.number_format = "#,##0.00"
+                elif ci == 12: cc.number_format = "0.0\"%\""
 
-        for ci, w in enumerate([8, 16, 14, 14, 14, 14, 14, 14, 12, 14], 1):
+        for ci, w in enumerate([8, 16, 14, 14, 14, 14, 14, 14, 14, 14, 12, 14], 1):
             ws_bess.column_dimensions[get_column_letter(ci)].width = w
         ws_bess.freeze_panes = "A4"
 
@@ -1301,14 +1309,15 @@ def generar_excel_analisis(df_metricas, df_resumen, sistema, proceso, fecha_ini,
 
     # Hoja Métricas Raw (todas las métricas calculadas)
     ws_m = wb.create_sheet("🔢 Métricas Calculadas")
-    ws_m.merge_cells("A1:I1")
+    ws_m.merge_cells("A1:K1")
     c = ws_m["A1"]; c.value = "Métricas BESS calculadas (datos raw)"
     c.font = Font(bold=True, color=C_WHITE, size=14, name="Arial")
     c.fill = PatternFill("solid", start_color=C_HEADER)
     c.alignment = Alignment(horizontal="center", vertical="center")
     ws_m.row_dimensions[1].height = 26
 
-    cols_m = ["Nodo", "PML promedio", "Volatilidad", "Spread P95-P5",
+    cols_m = ["Nodo", "PML promedio", "PML día (7-19)", "PML noche (20-6)",
+              "Volatilidad", "Spread P95-P5",
               "Spread día prom", "Spread día/noche", "Cambios bruscos",
               "Horas pico", "% horas neg"]
     for ci, col in enumerate(cols_m, 1):
@@ -1317,8 +1326,10 @@ def generar_excel_analisis(df_metricas, df_resumen, sistema, proceso, fecha_ini,
 
     for i, (_, r) in enumerate(df_metricas.iterrows(), 1):
         bg = C_ALT if i % 2 == 0 else None
-        valores = [r['nodo'], r['pml_promedio'], r['volatilidad'],
-                   r['spread_p95_p5'], r['spread_avg_diario'], r['spread_dia'],
+        valores = [r['nodo'], r['pml_promedio'],
+                   r.get('pml_dia', 0), r.get('pml_noche', 0),
+                   r['volatilidad'], r['spread_p95_p5'],
+                   r['spread_avg_diario'], r['spread_dia'],
                    r['cambios_bruscos'], r['horas_pico'], r['pct_horas_neg']]
         for ci, v in enumerate(valores, 1):
             cc = ws_m.cell(row=i+2, column=ci, value=v)
@@ -1326,10 +1337,10 @@ def generar_excel_analisis(df_metricas, df_resumen, sistema, proceso, fecha_ini,
             cc.border = BORDE
             cc.alignment = _ALIGN_NUM if ci != 1 else _ALIGN_TXT
             if bg: cc.fill = PatternFill("solid", start_color=bg)
-            if ci in (2, 3, 4, 5, 6): cc.number_format = "#,##0.00"
-            elif ci == 9: cc.number_format = "0.0\"%\""
+            if ci in (2, 3, 4, 5, 6, 7, 8): cc.number_format = "#,##0.00"
+            elif ci == 11: cc.number_format = "0.0\"%\""
 
-    for ci, w in enumerate([14, 14, 14, 14, 14, 14, 14, 12, 12], 1):
+    for ci, w in enumerate([14, 14, 14, 14, 14, 14, 14, 14, 14, 12, 12], 1):
         ws_m.column_dimensions[get_column_letter(ci)].width = w
     ws_m.freeze_panes = "A3"
 
@@ -1549,6 +1560,7 @@ def generar_excel_custom(df, df_resumen, df_metricas, opciones, sistema, proceso
         ws_b.row_dimensions[1].height = 26
 
         cols = ["Rank", "Nodo", "Score (0-100)", "PML promedio",
+                "PML día (7-19)", "PML noche (20-6)",
                 "Volatilidad", "Spread P95-P5", "Spread día prom",
                 "Cambios bruscos", "Horas pico", "% horas neg"]
         for ci, col in enumerate(cols, 1):
@@ -1558,6 +1570,7 @@ def generar_excel_custom(df, df_resumen, df_metricas, opciones, sistema, proceso
         for i, (_, r) in enumerate(df_score.iterrows(), 1):
             bg = C_ALT if i % 2 == 0 else None
             valores = [i, r['nodo'], r['score'], r['pml_promedio'],
+                       r.get('pml_dia', 0), r.get('pml_noche', 0),
                        r['volatilidad'], r['spread_p95_p5'],
                        r['spread_avg_diario'], r['cambios_bruscos'],
                        r['horas_pico'], r['pct_horas_neg']]
@@ -1567,10 +1580,10 @@ def generar_excel_custom(df, df_resumen, df_metricas, opciones, sistema, proceso
                 cc.border = BORDE
                 cc.alignment = _ALIGN_NUM if ci != 2 else _ALIGN_TXT
                 if bg: cc.fill = PatternFill("solid", start_color=bg)
-                if ci in (3, 4, 5, 6, 7): cc.number_format = "#,##0.00"
-                elif ci == 10: cc.number_format = "0.0\"%\""
+                if ci in (3, 4, 5, 6, 7, 8, 9): cc.number_format = "#,##0.00"
+                elif ci == 12: cc.number_format = "0.0\"%\""
 
-        for ci, w in enumerate([8, 16, 14, 14, 14, 14, 14, 14, 12, 14], 1):
+        for ci, w in enumerate([8, 16, 14, 14, 14, 14, 14, 14, 14, 14, 12, 14], 1):
             ws_b.column_dimensions[get_column_letter(ci)].width = w
         ws_b.freeze_panes = "A3"
 
@@ -2304,6 +2317,8 @@ def calcular_metricas_bess_cached(df_hash, _df):
             pml_noche = horas_noche["pml"].mean()
             spread_dia = pml_noche - pml_dia  # diferencial noche − día
         else:
+            pml_dia = 0
+            pml_noche = 0
             spread_dia = 0
 
         sub_sorted = sub.sort_values(["fecha_dt", "hora"])
@@ -2319,6 +2334,8 @@ def calcular_metricas_bess_cached(df_hash, _df):
         metricas.append({
             'nodo':          nodo,
             'pml_promedio':  round(prom, 2),
+            'pml_dia':       round(pml_dia, 2),
+            'pml_noche':     round(pml_noche, 2),
             'volatilidad':   round(std_v, 2),
             'spread_p95_p5': round(spread_p95_p5, 2),
             'spread_avg_diario': round(spread_avg_diario, 2),
@@ -2677,6 +2694,12 @@ def render_bess_scoring(df, use_case_default='Arbitraje'):
             "nodo":           st.column_config.TextColumn("Clave", width="small"),
             "score":          st.column_config.NumberColumn("Score BESS", format="%.1f"),
             "pml_promedio":   st.column_config.NumberColumn("PML promedio", format=fmt_moneda()),
+            "pml_dia":        st.column_config.NumberColumn(
+                "PML día (7-19h)", format=fmt_moneda(),
+                help="PML promedio horas diurnas (7:00–19:00, generación solar)."),
+            "pml_noche":      st.column_config.NumberColumn(
+                "PML noche (20-6h)", format=fmt_moneda(),
+                help="PML promedio horas nocturnas (20:00–6:00)."),
             "volatilidad":    st.column_config.NumberColumn("Volatilidad", format=fmt_moneda()),
             "spread_p95_p5":  st.column_config.NumberColumn("Spread P95-P5", format=fmt_moneda()),
             "spread_avg_diario": st.column_config.NumberColumn("Spread día prom", format=fmt_moneda()),
@@ -2852,86 +2875,85 @@ def render_centro_descargas(acumulado, catalogo, sistema, proceso, fecha_ini, fe
     sufijo = f"_{moneda}"
     n_nodos = len(acumulado)
 
-    # ─── Multi-año (todos los nodos si ≤20) ───
+    # ─── Multi-año (todos los nodos si ≤20) — DENTRO DE EXPANDER ───
     df_multianos_dict = None  # dict {nodo: df_pivot}
     incluir_multianos = False
 
     if n_nodos > 0 and n_nodos <= 20:
-        st.markdown("##### 📊 Gráficas multi-año en Excel de Análisis")
-        st.caption(
-            f"Como tu consulta tiene **{n_nodos} nodos** (≤20), el Excel de Análisis "
-            f"incluirá una hoja con gráfica nativa para **CADA nodo** mostrando el PML "
-            f"promedio mensual por año. Total: **{n_nodos} hojas con gráficas**."
-        )
-        incluir_multianos = st.toggle(
-            f"Incluir gráficas multi-año de los {n_nodos} nodos",
-            value=True,
-            key="tog_incluir_multianos",
-            help="Una hoja por nodo con tabla + gráfica de líneas nativa de Excel"
-        )
+        with st.expander(f"📊 Opciones avanzadas Excel de Análisis (≤20 nodos)", expanded=False):
+            st.caption(
+                f"Tu consulta tiene **{n_nodos} nodos** (≤20). Puedes incluir una hoja "
+                f"adicional con gráfica nativa de Excel por **CADA nodo** mostrando el "
+                f"PML promedio mensual por año. Total: **{n_nodos} hojas adicionales**."
+            )
+            incluir_multianos = st.toggle(
+                f"Incluir gráficas multi-año de los {n_nodos} nodos",
+                value=True,
+                key="tog_incluir_multianos",
+            )
 
-        if incluir_multianos and not df.empty:
-            df_multianos_dict = {}
-            for nodo_n in sorted(df["nodo"].unique()):
-                sub = df[df["nodo"] == nodo_n].copy()
-                if sub.empty:
-                    continue
-                sub["año"] = sub["fecha_dt"].dt.year
-                sub["mes_num"] = sub["fecha_dt"].dt.month
-                pivot = sub.pivot_table(values="pml", index="mes_num",
-                                          columns="año", aggfunc="mean").round(2)
-                df_multianos_dict[str(nodo_n)] = pivot.reset_index()
+            if incluir_multianos and not df.empty:
+                df_multianos_dict = {}
+                for nodo_n in sorted(df["nodo"].unique()):
+                    sub = df[df["nodo"] == nodo_n].copy()
+                    if sub.empty:
+                        continue
+                    sub["año"] = sub["fecha_dt"].dt.year
+                    sub["mes_num"] = sub["fecha_dt"].dt.month
+                    pivot = sub.pivot_table(values="pml", index="mes_num",
+                                              columns="año", aggfunc="mean").round(2)
+                    df_multianos_dict[str(nodo_n)] = pivot.reset_index()
 
-            # Mostrar resumen de años disponibles
-            sample_keys = list(df_multianos_dict.keys())[:1]
-            if sample_keys:
-                años_count = len([c for c in df_multianos_dict[sample_keys[0]].columns
-                                   if c != 'mes_num'])
-                if años_count >= 2:
-                    st.success(
-                        f"✅ {n_nodos} gráficas con **{años_count} años cada una** listas "
-                        f"para incluirse en el Excel de Análisis."
-                    )
-                else:
-                    st.info(
-                        f"ℹ️ Solo hay datos de **1 año** en la consulta. La gráfica "
-                        f"multi-año se incluirá pero tendrá una sola línea. Para "
-                        f"comparar años, consulta un período más largo."
-                    )
+                sample_keys = list(df_multianos_dict.keys())[:1]
+                if sample_keys:
+                    años_count = len([c for c in df_multianos_dict[sample_keys[0]].columns
+                                       if c != 'mes_num'])
+                    if años_count >= 2:
+                        st.success(
+                            f"✅ {n_nodos} gráficas con **{años_count} años cada una** "
+                            f"se incluirán en el Excel de Análisis."
+                        )
+                    else:
+                        st.info(
+                            f"ℹ️ Solo hay datos de **1 año** en la consulta. La gráfica "
+                            f"multi-año tendrá una sola línea."
+                        )
 
     elif n_nodos > 20:
-        st.info(
-            f"⚠️ Tu consulta tiene **{n_nodos} nodos**. Las gráficas multi-año "
-            f"solo se incluyen automáticamente si hay ≤20 nodos (para mantener el "
-            f"Excel manejable). Reduce tu consulta si quieres incluirlas."
+        st.caption(
+            f"ℹ️ Tu consulta tiene **{n_nodos} nodos**. Las gráficas multi-año por nodo "
+            f"solo se incluyen si hay ≤20 nodos (para mantener el Excel manejable)."
         )
 
-    st.markdown("##### 📦 Tipos de archivos disponibles")
-
-    # ─── Descripciones contextuales según tamaño ───
+    # ─── Descripciones contextuales según tamaño (normalizadas a 2 líneas) ───
     if n_nodos < 20:
-        desc_datos = f"📊 Excel **ligero** (~{n_nodos*150} KB · ~5s) — portada + resumen + 1 hoja por nodo"
-        desc_anal  = f"📈 Excel **compacto** (~80 KB · ~3s) — BESS Scoring 3 use cases + métricas"
+        desc_datos = f"~{n_nodos*150} KB · ~5s\n1 hoja por nodo + portada + resumen"
         if incluir_multianos:
-            desc_anal += " + gráfica multi-año"
+            desc_anal = f"~{80 + n_nodos*5} KB · ~5s\nBESS + {n_nodos} gráficas multi-año"
+        else:
+            desc_anal = "~80 KB · ~3s\nBESS Scoring 3 use cases + métricas"
     elif n_nodos <= 50:
-        desc_datos = f"📊 Excel **medio** (~{n_nodos*200} KB · ~30s) — 1 hoja por nodo"
-        desc_anal  = f"📈 Excel **compacto** (~100 KB · ~5s) — BESS Scoring 3 use cases + métricas"
+        desc_datos = f"~{n_nodos*200} KB · ~30s\n1 hoja por nodo (registros horarios)"
+        desc_anal  = "~100 KB · ~5s\nBESS Scoring 3 use cases + métricas"
     elif n_nodos <= 100:
-        desc_datos = f"📊 Excel **pesado** (~{n_nodos*250} KB · 1-2 min) — 1 hoja por nodo · puede tardar al abrir"
-        desc_anal  = f"📈 Excel **compacto** (~120 KB · ~10s) — BESS Scoring 3 use cases + métricas"
+        desc_datos = f"~{n_nodos*250} KB · 1-2 min\n1 hoja por nodo · puede ser pesado al abrir"
+        desc_anal  = "~120 KB · ~10s\nBESS Scoring 3 use cases + métricas"
     else:
-        desc_datos = f"📊 Excel **muy pesado** (~{n_nodos*300} KB · 2-5 min) — ⚠️ usa modo Solo Datos con cuidado"
-        desc_anal  = f"📈 Excel **compacto** (~150 KB · ~20s) — BESS Scoring 3 use cases + métricas"
+        desc_datos = f"~{n_nodos*300} KB · 2-5 min\n⚠️ archivo muy pesado"
+        desc_anal  = "~150 KB · ~20s\nBESS Scoring 3 use cases + métricas"
 
-    col1, col2, col3 = st.columns(3)
+    desc_kmz = "~10-200 KB · ~5s\nNodos geolocalizados para Google Earth"
+
+    # ─── 3 CAJAS ALINEADAS — Datos / Análisis / KMZ ───
+    st.markdown("##### 📦 Archivos disponibles")
+    col1, col2, col3 = st.columns(3, gap="medium")
 
     with col1:
-        st.markdown("##### 📊 Excel de Datos")
+        st.markdown("**📊 Excel de Datos**")
         st.caption(desc_datos)
         if "excel_datos_bytes" not in st.session_state:
             st.session_state["excel_datos_bytes"] = None
-        if st.button("Generar y descargar", key="btn_gen_datos", type="primary",
+        if st.button("⚡ Generar y descargar", key="btn_gen_datos", type="primary",
                       use_container_width=True):
             with st.spinner(f"Generando Excel de datos ({n_nodos} nodos)..."):
                 st.session_state["excel_datos_bytes"] = generar_excel_datos(
@@ -2948,11 +2970,11 @@ def render_centro_descargas(acumulado, catalogo, sistema, proceso, fecha_ini, fe
             )
 
     with col2:
-        st.markdown("##### 📈 Excel de Análisis")
+        st.markdown("**📈 Excel de Análisis**")
         st.caption(desc_anal)
         if "excel_analisis_bytes" not in st.session_state:
             st.session_state["excel_analisis_bytes"] = None
-        if st.button("Generar y descargar", key="btn_gen_anal", type="primary",
+        if st.button("⚡ Generar y descargar", key="btn_gen_anal", type="primary",
                       use_container_width=True):
             if df_metricas.empty:
                 st.error("No hay suficientes datos para generar análisis.")
@@ -2973,10 +2995,10 @@ def render_centro_descargas(acumulado, catalogo, sistema, proceso, fecha_ini, fe
             )
 
     with col3:
-        st.markdown("##### 🌍 KMZ Geográfico")
-        st.caption("🌍 Archivo Google Earth (~10-200 KB) — nodos mapeados con calidad del match")
+        st.markdown("**🌍 KMZ Geográfico**")
+        st.caption(desc_kmz)
         if matches_df is None or matches_df.empty:
-            st.info("⚠️ La geocodificación no se hizo. Activa el toggle '🗺️ Incluir geocodificación' en el sidebar y vuelve a ejecutar.")
+            st.caption("⚠️ Activa 'Incluir geocodificación' en sidebar para habilitarlo.")
         else:
             n_mapeados = matches_df['lat'].notna().sum()
             if n_mapeados == 0:
@@ -2984,7 +3006,7 @@ def render_centro_descargas(acumulado, catalogo, sistema, proceso, fecha_ini, fe
             else:
                 if "kmz_bytes" not in st.session_state:
                     st.session_state["kmz_bytes"] = None
-                if st.button(f"Generar y descargar ({n_mapeados} nodos)",
+                if st.button(f"⚡ Generar ({n_mapeados} nodos)",
                               key="btn_gen_kmz", type="primary",
                               use_container_width=True):
                     with st.spinner("Generando KMZ..."):
